@@ -23,7 +23,16 @@ _ACTIVE_STATES = {"queued", "running", "waiting", "stop_requested"}
 _TERMINAL_STATES = {"completed", "failed"}
 _TASKS: dict[str, asyncio.Task] = {}
 _TASKS_LOCK = threading.RLock()
+_ACCOUNT_LOCKS: dict[str, asyncio.Lock] = {}
 _SCHEMA_LOCK = threading.RLock()
+
+
+def _account_lock(phone: str) -> asyncio.Lock:
+    lock = _ACCOUNT_LOCKS.get(phone)
+    if lock is None:
+        lock = asyncio.Lock()
+        _ACCOUNT_LOCKS[phone] = lock
+    return lock
 
 
 def _connect() -> sqlite3.Connection:
@@ -588,56 +597,62 @@ async def _run(job_id: str) -> None:
 
             phone = account["phone"]
             current = phone
-            if not _claim(job_id, int(recipient["idx"]), phone):
+            account_lock = _account_lock(phone)
+            if account_lock.locked():
+                rotate = True
+                await asyncio.sleep(0)
                 continue
-            target = json.loads(recipient["target_json"])
-            content = json.loads(job["content_json"])
-            try:
-                await _send(phone, target, content)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # fail over; never wait on a broken account
-                detail = f"{type(exc).__name__}: {str(exc)[:180]}"
-                flood = _flood_seconds(exc)
-                now = time.time()
-                if flood is not None:
-                    cooldown = now + flood
-                    _record_attempt(job_id, int(recipient["idx"]), phone, "flood", detail)
+            async with account_lock:
+                if not _claim(job_id, int(recipient["idx"]), phone):
+                    continue
+                target = json.loads(recipient["target_json"])
+                content = json.loads(job["content_json"])
+                try:
+                    await _send(phone, target, content)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # fail over; never wait on a broken account
+                    detail = f"{type(exc).__name__}: {str(exc)[:180]}"
+                    flood = _flood_seconds(exc)
+                    now = time.time()
+                    if flood is not None:
+                        cooldown = now + flood
+                        _record_attempt(job_id, int(recipient["idx"]), phone, "flood", detail)
+                        with _connect() as conn:
+                            conn.execute(
+                                "UPDATE tg_multi_accounts SET cooldown_until=?,failure_count=failure_count+1,last_error=? "
+                                "WHERE job_id=? AND phone=?", (cooldown, detail, job_id, phone),)
+                            conn.execute(
+                                "UPDATE tg_multi_recipients SET state='pending',last_error=?,updated_at=? "
+                                "WHERE job_id=? AND idx=?", (detail, now, job_id, recipient["idx"]),)
+                        current = phone
+                        rotate = True
+                        continue
+
+                    _record_attempt(job_id, int(recipient["idx"]), phone, "error", detail)
+                    disable = 1 if _auth_failure(exc) else 0
                     with _connect() as conn:
                         conn.execute(
-                            "UPDATE tg_multi_accounts SET cooldown_until=?,failure_count=failure_count+1,last_error=? "
-                            "WHERE job_id=? AND phone=?", (cooldown, detail, job_id, phone),)
+                            "UPDATE tg_multi_accounts SET enabled=CASE WHEN ?=1 THEN 0 ELSE enabled END,"
+                            "failure_count=failure_count+1,last_error=? WHERE job_id=? AND phone=?",
+                            (disable, detail, job_id, phone),)
                         conn.execute(
                             "UPDATE tg_multi_recipients SET state='pending',last_error=?,updated_at=? "
                             "WHERE job_id=? AND idx=?", (detail, now, job_id, recipient["idx"]),)
+                        conn.execute("UPDATE tg_multi_jobs SET last_error=?,updated_at=? WHERE job_id=?",
+                                     (detail, now, job_id),)
+                    if _recipient_exhausted(job_id, int(recipient["idx"])):
+                        with _connect() as conn:
+                            conn.execute(
+                                "UPDATE tg_multi_recipients SET state='failed',updated_at=? WHERE job_id=? AND idx=?",
+                                (now, job_id, recipient["idx"]),)
+                            conn.execute(
+                                "UPDATE tg_multi_jobs SET failed_count=failed_count+1,updated_at=? WHERE job_id=?",
+                                (now, job_id),)
+                        _advance_index(job_id)
                     current = phone
                     rotate = True
                     continue
-
-                _record_attempt(job_id, int(recipient["idx"]), phone, "error", detail)
-                disable = 1 if _auth_failure(exc) else 0
-                with _connect() as conn:
-                    conn.execute(
-                        "UPDATE tg_multi_accounts SET enabled=CASE WHEN ?=1 THEN 0 ELSE enabled END,"
-                        "failure_count=failure_count+1,last_error=? WHERE job_id=? AND phone=?",
-                        (disable, detail, job_id, phone),)
-                    conn.execute(
-                        "UPDATE tg_multi_recipients SET state='pending',last_error=?,updated_at=? "
-                        "WHERE job_id=? AND idx=?", (detail, now, job_id, recipient["idx"]),)
-                    conn.execute("UPDATE tg_multi_jobs SET last_error=?,updated_at=? WHERE job_id=?",
-                                 (detail, now, job_id),)
-                if _recipient_exhausted(job_id, int(recipient["idx"])):
-                    with _connect() as conn:
-                        conn.execute(
-                            "UPDATE tg_multi_recipients SET state='failed',updated_at=? WHERE job_id=? AND idx=?",
-                            (now, job_id, recipient["idx"]),)
-                        conn.execute(
-                            "UPDATE tg_multi_jobs SET failed_count=failed_count+1,updated_at=? WHERE job_id=?",
-                            (now, job_id),)
-                    _advance_index(job_id)
-                current = phone
-                rotate = True
-                continue
 
             now = time.time()
             _record_attempt(job_id, int(recipient["idx"]), phone, "sent", "")

@@ -438,7 +438,13 @@ async def start_handler(event):
         await event.respond("⛔ شما به این ربات دسترسی ندارید.")
         return
     state.pop(event.sender_id, None)
-    await event.respond(WELCOME, buttons=main_menu(is_real_owner(event)))
+    text = WELCOME
+    try:
+        import status_summary
+        text = status_summary.format_card(await status_summary.get_summary()) + "\n\nیکی از گزینه‌ها رو انتخاب کن:"
+    except Exception:
+        pass
+    await event.respond(text, buttons=main_menu(is_real_owner(event)))
 
 
 @bot.on(events.CallbackQuery(data=b"home"))
@@ -1613,6 +1619,7 @@ async def run_send(owner_id: int, payload: dict):
     tag = payload.get("tag") or ""
     start_idx = int(payload.get("start_idx") or 0)
     base_ok = int(payload.get("base_ok") or 0)
+    checkpoint = payload.get("_checkpoint")
     suppress_panel = bool(payload.get("suppress_resume_panel"))
     # YoudonoaAx UPDATE (Item 2): the send pipeline can either forward the
     # marked Saved-Messages post ('marker' mode, the original behaviour) or send
@@ -1731,6 +1738,13 @@ async def run_send(owner_id: int, payload: dict):
                     if attempt_fail >= max_errors:
                         hit_max = True
                         break
+                if checkpoint:
+                    try:
+                        checkpoint_result = checkpoint(idx, base_ok + ok)
+                        if asyncio.iscoroutine(checkpoint_result):
+                            await checkpoint_result
+                    except Exception:
+                        pass
                 await asyncio.sleep(delay)
 
             if reason:                       # manual stop / dead session
@@ -4854,6 +4868,8 @@ async def tg_menu_cb(event):
         rows.append([Button.inline(f"{mark} {a['phone']} — {a['name']}",
                                    f"tgacc_{a['rid']}".encode())])
     rows.append([Button.inline("➕ افزودن اکانت", b"tgadd")])
+    rows.append([Button.inline("📤 ارسال چنداکانتی", b"tg_multi"),
+                 Button.inline("📊 وضعیت ارسال‌ها", b"tg_multi_jobs")])
     rows.append([Button.inline("🔙 بازگشت به روبیکا", b"home")])
     head = card("✈️ پنل تلگرام", [
         f"👤 اکانت‌ها : {len(accs)}",
@@ -5426,6 +5442,17 @@ async def amain():
     account_conn.set_invalid_auth_handler(_on_invalid_auth)
     account_conn.start_janitor()
     await bot.start(bot_token=config.BOT_TOKEN)
+    # Additive Telegram multi-account panel; no client/session logic lives here.
+    try:
+        import telegram_multi_panel
+        import telegram_multi_send
+        telegram_multi_panel.register(
+            client=bot, events=events, Button=Button, state=state,
+            is_owner=is_owner, safe_edit=safe_edit,
+        )
+        await telegram_multi_send.restore_pending()
+    except Exception as _tme:
+        await log(card("⚠️ - #Telegram_Multi_Error", [f"🔧 boot: {repr(_tme)[:180]}"]))
     await log(card("Online", [f"Rubika Project {config.VERSION}", LINE, f"🕒 {now()}"]))
     print(f"Panel is running (version {config.VERSION}).")
     # ---- Portal (isolated, additive) ----
