@@ -9,6 +9,7 @@ isolated durable job tables and never constructs Telegram sessions itself.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import sqlite3
@@ -17,6 +18,7 @@ import time
 import uuid
 from typing import Any, Iterable
 
+import config
 import db
 import telegram_client as tg
 
@@ -26,6 +28,15 @@ _TASKS: dict[str, asyncio.Task] = {}
 _TASKS_LOCK = threading.RLock()
 _ACCOUNT_LOCKS: dict[str, asyncio.Lock] = {}
 _SCHEMA_LOCK = threading.RLock()
+
+# After this many CONSECUTIVE restriction errors (PeerFlood / "too many
+# requests") on one account, abandon it and move to the next account. A single
+# successful send resets the counter, so a healthy account is never dropped for
+# a few scattered failures.
+MAX_CONSECUTIVE_FAILS = 5
+# How many times one account may come back from a FloodWait cooldown before it
+# is given up on permanently (bounds the wait/retry loop).
+MAX_FLOODWAIT_ROUNDS = 3
 
 
 class SenderOwnershipError(RuntimeError):
@@ -130,6 +141,7 @@ def _init() -> None:
             "content_items": "INTEGER NOT NULL DEFAULT 0",
             "start_logged": "INTEGER NOT NULL DEFAULT 0",
             "finish_logged": "INTEGER NOT NULL DEFAULT 0",
+            "log_msg_id": "INTEGER",
         })
         _add_columns(conn, "tg_multi_accounts", {
             "state": "TEXT NOT NULL DEFAULT 'pending'",
@@ -138,6 +150,8 @@ def _init() -> None:
             "recipient_index": "INTEGER NOT NULL DEFAULT 0",
             "stop_reason": "TEXT DEFAULT ''",
             "finished_at": "REAL",
+            "consec_fail": "INTEGER NOT NULL DEFAULT 0",
+            "floodwait_rounds": "INTEGER NOT NULL DEFAULT 0",
         })
         _add_columns(conn, "tg_multi_recipients", {
             "phone": "TEXT NOT NULL DEFAULT ''",
@@ -742,15 +756,38 @@ def _auth_failure(exc: BaseException) -> bool:
     ))
 
 
-def _account_failure(exc: BaseException) -> bool:
+def _hard_account_failure(exc: BaseException) -> bool:
+    """Errors that mean the account cannot work AT ALL right now (auth revoked,
+    lost connection, ownership taken by the ordinary sender). These abandon the
+    account immediately. FloodWait is handled separately (cooldown + retry)."""
     if isinstance(exc, SenderOwnershipError):
         return True
-    if _flood_seconds(exc) is not None or _auth_failure(exc):
+    if _auth_failure(exc):
         return True
     name = type(exc).__name__.lower()
     return isinstance(exc, (ConnectionError, TimeoutError, OSError)) or any(
         token in name for token in ("connection", "network", "disconnect")
     )
+
+
+def _restriction_error(exc: BaseException) -> bool:
+    """Account-wide send restrictions (spam limit). These do NOT abandon the
+    account on the first hit, but count toward MAX_CONSECUTIVE_FAILS so a truly
+    blocked account is dropped quickly instead of failing on every contact."""
+    text = f"{type(exc).__name__}:{exc}".upper()
+    return any(token in text for token in (
+        "PEERFLOOD", "PEER_FLOOD", "TOO MANY REQUESTS", "TOOMANYREQUESTS",
+    ))
+
+
+def _transient_db_error(exc: BaseException) -> bool:
+    """A momentary SQLite contention error ('database is locked' / 'busy').
+    This is NOT the account's fault, so it must never burn the account; the job
+    is paused instead and resumes cleanly from its durable checkpoint."""
+    if not isinstance(exc, sqlite3.Error):
+        return False
+    text = str(exc).lower()
+    return "locked" in text or "busy" in text
 
 
 async def _prepare_content(client: Any, phone: str, content: dict, marker: dict) -> list[dict]:
@@ -784,10 +821,8 @@ async def _send_content(client: Any, target: Any, prepared: list[dict], phone: s
                 await tg.send_saved_media(client, target, item["saved"], item["caption"])
             else:
                 await tg.send_media(client, target, item["path"], item["caption"], typing=0)
-            db.tg_incr_sent(phone, 1)
         elif item["text"]:
             await tg.send_text(client, target, item["text"], typing=0)
-            db.tg_incr_sent(phone, 1)
         if not _owns_sender(phone, marker):
             raise SenderOwnershipError("sender ownership changed during delivery")
         if len(prepared) > 1:
@@ -844,6 +879,185 @@ def _mark_account_completed(job_id: str, phone: str) -> None:
         conn.execute(
             "UPDATE tg_multi_jobs SET account_index=account_index+1,updated_at=? WHERE job_id=?",
             (now, job_id),)
+
+
+def _mark_account_floodwait(job_id: str, phone: str, reason: str, flood: int,
+                            current_idx: int | None) -> bool:
+    """Park an account that hit a FloodWait. Returns True if it is a TEMPORARY
+    cooldown (the account keeps its pending recipients and will be retried once
+    the cooldown expires); returns False if it exhausted MAX_FLOODWAIT_ROUNDS
+    and was given up on (remaining recipients skipped)."""
+    now = time.time()
+    with _connect() as conn:
+        rounds_row = conn.execute(
+            "SELECT floodwait_rounds FROM tg_multi_accounts WHERE job_id=? AND phone=?",
+            (job_id, phone),).fetchone()
+        rounds = int((rounds_row["floodwait_rounds"] if rounds_row else 0) or 0) + 1
+        if rounds > MAX_FLOODWAIT_ROUNDS:
+            uncertain = 0
+            if current_idx is not None:
+                cur = conn.execute(
+                    "UPDATE tg_multi_recipients SET state='uncertain',last_error=?,updated_at=? "
+                    "WHERE job_id=? AND idx=? AND state='inflight'",
+                    (reason[:240], now, job_id, current_idx),)
+                uncertain = int(cur.rowcount or 0)
+            pending = conn.execute(
+                "SELECT COUNT(*) AS n FROM tg_multi_recipients WHERE job_id=? AND phone=? AND state='pending'",
+                (job_id, phone),).fetchone()
+            skipped = int(pending["n"] or 0)
+            conn.execute(
+                "UPDATE tg_multi_recipients SET state='skipped',last_error=?,updated_at=? "
+                "WHERE job_id=? AND phone=? AND state='pending'", (reason[:240], now, job_id, phone),)
+            conn.execute(
+                "UPDATE tg_multi_accounts SET state='failed',enabled=0,cooldown_until=0,floodwait_rounds=?,"
+                "failure_count=failure_count+1,last_error=?,stop_reason=?,finished_at=? WHERE job_id=? AND phone=?",
+                (rounds, reason[:240], "floodwait rounds exceeded", now, job_id, phone),)
+            conn.execute(
+                "UPDATE tg_multi_jobs SET skipped_count=skipped_count+?,uncertain_count=uncertain_count+?,"
+                "last_error=?,account_index=account_index+1,updated_at=? WHERE job_id=?",
+                (skipped, uncertain, reason[:240], now, job_id),)
+            _advance_index(job_id, phone)
+            return False
+        # temporary cooldown: return the in-flight recipient to the pending pool
+        # and keep the rest pending so nothing is lost while we wait.
+        if current_idx is not None:
+            conn.execute(
+                "UPDATE tg_multi_recipients SET state='pending',last_error=?,updated_at=? "
+                "WHERE job_id=? AND idx=? AND state='inflight'", (reason[:240], now, job_id, current_idx),)
+        conn.execute(
+            "UPDATE tg_multi_accounts SET state='floodwait',enabled=0,cooldown_until=?,floodwait_rounds=?,"
+            "last_error=?,stop_reason=? WHERE job_id=? AND phone=?",
+            (now + max(1, int(flood)), rounds, reason[:240], "floodwait cooldown", job_id, phone),)
+        conn.execute(
+            "UPDATE tg_multi_jobs SET last_error=?,current_account=NULL,updated_at=? WHERE job_id=?",
+            (reason[:240], now, job_id),)
+    _advance_index(job_id, phone)
+    return True
+
+
+def _next_floodwait_wait(job_id: str) -> float | None:
+    """Seconds until the earliest FloodWait cooldown expires, or None if no
+    account is currently in a FloodWait cooldown."""
+    now = time.time()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT MIN(cooldown_until) AS c FROM tg_multi_accounts WHERE job_id=? AND state='floodwait'",
+            (job_id,),).fetchone()
+    if not row or row["c"] is None:
+        return None
+    return max(0.0, float(row["c"]) - now)
+
+
+def _reactivate_floodwait(job_id: str) -> int:
+    """Flip every FloodWait account whose cooldown has expired back to pending."""
+    now = time.time()
+    with _connect() as conn:
+        cur = conn.execute(
+            "UPDATE tg_multi_accounts SET state='pending',enabled=1 "
+            "WHERE job_id=? AND state='floodwait' AND cooldown_until<=?", (job_id, now),)
+        return int(cur.rowcount or 0)
+
+
+# --------------------------------------------------------------------------- #
+# Live status card in the log group (same in-place-edit style as the ordinary
+# single-account "زنده" send card). One message per job, reused across
+# resumes/restarts via a persisted log_msg_id.
+# --------------------------------------------------------------------------- #
+_LIVE_STATE_FA = {
+    "queued": "⏳ در صف", "running": "🟢 در حال ارسال", "waiting": "⏳ انتظار",
+    "stop_requested": "⏹ در حال توقف", "paused": "⏸ متوقف",
+    "completed": "✅ پایان", "failed": "⛔ خطا",
+}
+
+
+def _live_card_text(job_id: str) -> str:
+    import bot
+    with _connect() as conn:
+        job = conn.execute(
+            "SELECT state,total,sent_count,failed_count,skipped_count,uncertain_count,"
+            "current_account,account_index FROM tg_multi_jobs WHERE job_id=?", (job_id,)).fetchone()
+        n_row = conn.execute("SELECT COUNT(*) AS n FROM tg_multi_accounts WHERE job_id=?", (job_id,)).fetchone()
+        cur = None
+        if job and job["current_account"]:
+            cur = conn.execute(
+                "SELECT phone,state,consec_fail FROM tg_multi_accounts WHERE job_id=? AND phone=?",
+                (job_id, job["current_account"]),).fetchone()
+    if not job:
+        return bot.card("✈️ ارسال چند اکانتی — زنده", ["اطلاعات یافت نشد"])
+    total = int(job["total"] or 0)
+    sent = int(job["sent_count"] or 0)
+    failed = int(job["failed_count"] or 0)
+    skipped = int(job["skipped_count"] or 0)
+    uncertain = int(job["uncertain_count"] or 0)
+    done = sent + failed + skipped + uncertain
+    pct = int(done * 100 / total) if total else 0
+    n_acc = int(n_row["n"] or 0) if n_row else 0
+    pos = min(int(job["account_index"] or 0) + 1, n_acc) if n_acc else 0
+    status_fa = _LIVE_STATE_FA.get(job["state"], job["state"])
+    consec = int(cur["consec_fail"] or 0) if cur else 0
+    if cur and cur["state"] == "floodwait":
+        status_fa = "⏳ انتظار FloodWait"
+    cur_phone = job["current_account"] or "—"
+    rows = [
+        f"👤 اکانت فعال : {cur_phone}  ({pos}/{n_acc})",
+        f"وضعیت : {status_fa}",
+        f"📊 {done} از {total} — {pct}%",
+        f"✅ موفق : {sent}   ❌ ناموفق : {failed}   ⏭ رد : {skipped}",
+        f"⚠️ خطای پیاپی اکانت : {consec}/{MAX_CONSECUTIVE_FAILS}",
+        f"🕒 {config.now_str()}",
+    ]
+    if uncertain:
+        rows.insert(4, f"❔ نامشخص : {uncertain}")
+    return bot.card("✈️ ارسال چند اکانتی — زنده (اول دوطرفه‌ها)", rows)
+
+
+async def _post_live_card(job_id: str) -> None:
+    import bot
+    try:
+        msg = await bot.bot.send_message(config.LOG_GROUP_ID, _live_card_text(job_id))
+    except Exception:
+        return
+    with contextlib.suppress(Exception):
+        with _connect() as conn:
+            conn.execute("UPDATE tg_multi_jobs SET log_msg_id=? WHERE job_id=?",
+                         (int(getattr(msg, "id", 0) or 0), job_id),)
+
+
+async def _edit_live_card(job_id: str) -> None:
+    import bot
+    with _connect() as conn:
+        row = conn.execute("SELECT log_msg_id FROM tg_multi_jobs WHERE job_id=?", (job_id,)).fetchone()
+    msg_id = int(row["log_msg_id"]) if row and row["log_msg_id"] else 0
+    if not msg_id:
+        await _post_live_card(job_id)
+        return
+    # Silent like the single-send safe_edit: ignore "not modified" and any
+    # transient edit error (never repost, so the log group is never spammed).
+    with contextlib.suppress(Exception):
+        await bot.bot.edit_message(config.LOG_GROUP_ID, msg_id, _live_card_text(job_id))
+
+
+async def _ensure_live_card(job_id: str) -> None:
+    with _connect() as conn:
+        row = conn.execute("SELECT log_msg_id FROM tg_multi_jobs WHERE job_id=?", (job_id,)).fetchone()
+    if row and row["log_msg_id"]:
+        await _edit_live_card(job_id)
+    else:
+        await _post_live_card(job_id)
+
+
+async def _live_progress_loop(job_id: str) -> None:
+    interval = max(2.0, float(getattr(config, "TG_STATS_REFRESH", 5.0)))
+    try:
+        while True:
+            row = _job(job_id)
+            if not row or row["state"] not in ("queued", "running", "waiting", "stop_requested"):
+                break
+            with contextlib.suppress(Exception):
+                await _edit_live_card(job_id)
+            await asyncio.sleep(interval)
+    except asyncio.CancelledError:
+        raise
 
 
 async def _run_account(job_id: str, account: dict) -> bool:
@@ -909,23 +1123,68 @@ async def _run_account(job_id: str, account: dict) -> bool:
                     raise
                 except Exception as exc:
                     detail = f"{type(exc).__name__}: {str(exc)[:180]}"
-                    await _log_error(phone, f"ارسال به مخاطب {uid or recipient['recipient_key']}", exc)
                     _record_attempt(job_id, idx, phone, "error", detail)
-                    if _account_failure(exc):
+
+                    # 1) FloodWait -> cooldown, keep recipients, retry later.
+                    flood = _flood_seconds(exc)
+                    if flood is not None:
+                        wait = min(int(flood), int(getattr(config, "TG_FLOOD_MAX_WAIT", 300)))
+                        temporary = _mark_account_floodwait(job_id, phone, detail, wait, idx)
+                        if temporary:
+                            await _log_card("⏳ - اکانت در انتظار FloodWait", [
+                                f"📱 {phone}", f"⏳ {wait} ثانیه صبر",
+                                "➡️ بعد از پایان انتظار، مخاطبان باقی‌مانده‌اش دوباره ادامه می‌یابد",
+                                f"🕒 {config.now_str()}"])
+                        else:
+                            await _log_card("⛔ - اکانت به‌خاطر FloodWait رها شد", [
+                                f"📱 {phone}", "❌ سقف تکرار FloodWait رد شد",
+                                "➡️ ادامه با اکانت بعدی", f"🕒 {config.now_str()}"])
+                        return True
+
+                    # 2) Hard failure (auth revoked / connection / ownership) ->
+                    #    abandon the account now (single log card, no spam).
+                    if _hard_account_failure(exc):
+                        await _log_error(phone, "ارسال (خطای اتصال/دسترسی اکانت)", exc)
                         _mark_account_stopped(job_id, phone, detail, exc, idx)
                         return True
+
+                    # 3) Per-recipient failure. Restriction errors (PeerFlood /
+                    #    too-many-requests) count toward the consecutive limit;
+                    #    genuine per-recipient errors just skip that contact. No
+                    #    per-recipient log card is posted (the live card carries
+                    #    the running failure count instead of spamming the group).
                     now = time.time()
+                    consec = 0
+                    is_restriction = _restriction_error(exc)
                     with _connect() as conn:
                         conn.execute(
                             "UPDATE tg_multi_recipients SET state='failed',last_error=?,updated_at=? "
                             "WHERE job_id=? AND idx=?", (detail, now, job_id, idx),)
                         conn.execute(
-                            "UPDATE tg_multi_accounts SET failure_count=failure_count+1,last_error=? "
-                            "WHERE job_id=? AND phone=?", (detail, job_id, phone),)
-                        conn.execute(
                             "UPDATE tg_multi_jobs SET failed_count=failed_count+1,last_error=?,updated_at=? "
                             "WHERE job_id=?", (detail, now, job_id),)
+                        if is_restriction:
+                            conn.execute(
+                                "UPDATE tg_multi_accounts SET failure_count=failure_count+1,"
+                                "consec_fail=consec_fail+1,last_error=? WHERE job_id=? AND phone=?",
+                                (detail, job_id, phone),)
+                            crow = conn.execute(
+                                "SELECT consec_fail FROM tg_multi_accounts WHERE job_id=? AND phone=?",
+                                (job_id, phone),).fetchone()
+                            consec = int((crow["consec_fail"] if crow else 0) or 0)
+                        else:
+                            conn.execute(
+                                "UPDATE tg_multi_accounts SET failure_count=failure_count+1,last_error=? "
+                                "WHERE job_id=? AND phone=?", (detail, job_id, phone),)
                     _advance_index(job_id, phone)
+
+                    if is_restriction and consec >= MAX_CONSECUTIVE_FAILS:
+                        reason = f"{MAX_CONSECUTIVE_FAILS} خطای پیاپی محدودیت ({type(exc).__name__})"
+                        _mark_account_stopped(job_id, phone, reason, exc)
+                        await _log_card("⛔ - اکانت رها شد (سقف خطا)", [
+                            f"📱 {phone}", f"📛 دلیل: {reason}",
+                            "➡️ ادامه با اکانت بعدی", f"🕒 {config.now_str()}"])
+                        return True
                     continue
 
                 now = time.time()
@@ -935,11 +1194,15 @@ async def _run_account(job_id: str, account: dict) -> bool:
                         "UPDATE tg_multi_recipients SET state='sent',sent_by=?,last_error='',updated_at=? "
                         "WHERE job_id=? AND idx=? AND state='inflight'", (phone, now, job_id, idx),)
                     conn.execute(
-                        "UPDATE tg_multi_accounts SET sent_count=sent_count+1,last_error='' "
+                        "UPDATE tg_multi_accounts SET sent_count=sent_count+1,consec_fail=0,last_error='' "
                         "WHERE job_id=? AND phone=?", (job_id, phone),)
                     conn.execute(
                         "UPDATE tg_multi_jobs SET sent_count=sent_count+1,last_error='',updated_at=? WHERE job_id=?",
                         (now, job_id),)
+                # Count ONE delivery per recipient on the account's lifetime
+                # counter (previously counted once per content item -> inflated).
+                with contextlib.suppress(Exception):
+                    db.tg_incr_sent(phone, 1)
                 if uid is not None:
                     db.tg_mark_sent(uid)
                 _advance_index(job_id, phone)
@@ -949,6 +1212,13 @@ async def _run_account(job_id: str, account: dict) -> bool:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            # A transient SQLite lock is not the account's fault: pause the job
+            # (fully resumable from the durable checkpoint) instead of burning
+            # the account. Everything else abandons this account and moves on.
+            if _transient_db_error(exc):
+                with contextlib.suppress(Exception):
+                    _pause(job_id)
+                return False
             detail = f"{type(exc).__name__}: {str(exc)[:180]}"
             await _log_error(phone, "اتصال/آماده‌سازی اکانت", exc)
             _mark_account_stopped(job_id, phone, detail, exc)
@@ -958,8 +1228,12 @@ async def _run_account(job_id: str, account: dict) -> bool:
 
 
 async def _run(job_id: str) -> None:
+    prog: asyncio.Task | None = None
     try:
         await _log_start_once(job_id)
+        with contextlib.suppress(Exception):
+            await _ensure_live_card(job_id)
+        prog = asyncio.create_task(_live_progress_loop(job_id))
         while True:
             job = _job(job_id)
             if not job:
@@ -969,9 +1243,24 @@ async def _run(job_id: str) -> None:
                 return
             account = _next_account(job_id)
             if not account:
-                _finish(job_id, "completed")
-                await _log_finish_once(job_id)
-                return
+                # No ready account. If some accounts are only parked in a
+                # FloodWait cooldown, wait for the earliest one and revive it;
+                # otherwise the job is genuinely finished.
+                wait_s = _next_floodwait_wait(job_id)
+                if wait_s is None:
+                    _finish(job_id, "completed")
+                    await _log_finish_once(job_id)
+                    return
+                if not await _interruptible_sleep(job_id, min(max(wait_s, 1.0), 30.0)):
+                    _pause(job_id)
+                    return
+                reactivated = _reactivate_floodwait(job_id)
+                if reactivated == 0 and wait_s <= 0.5:
+                    # nothing left to revive -> avoid a tight loop, finish.
+                    _finish(job_id, "completed")
+                    await _log_finish_once(job_id)
+                    return
+                continue
             if not await _run_account(job_id, account):
                 return
     except asyncio.CancelledError:
@@ -981,3 +1270,10 @@ async def _run(job_id: str) -> None:
         _finish(job_id, "failed", detail)
         await _log_error("", "اجرای Job", exc)
         await _log_finish_once(job_id)
+    finally:
+        if prog is not None:
+            prog.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await prog
+        with contextlib.suppress(Exception):
+            await _edit_live_card(job_id)
