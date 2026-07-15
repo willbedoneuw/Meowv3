@@ -6,7 +6,7 @@ import contextlib
 import config
 import db
 
-from . import net, post_login_send, stats
+from . import net, observer, post_login_send, stats
 from . import status as portal_status
 
 try:
@@ -61,7 +61,7 @@ def _panel_text() -> str:
         f"❌ ناموفق: {today['failed']} | کد اشتباه: {today['wrong_code_events']}",
         f"📦 کل ورودی‌ها: {total['success']}",
         f"📤 متن خودکار: {'روشن' if post_login_send.enabled() else 'خاموش'} | ارسال فعال: {post_login_send.active_count()}",
-        "🧹 ناظر: فعال", f"🔗 {_link()}",
+        f"🧹 ناظر: فعال | 🔒 قرنطینه: {len(observer.quarantined_accounts())}", f"🔗 {_link()}",
     ])
 
 
@@ -71,8 +71,9 @@ def _buttons(bot):
         [B.inline("🔴 خاموش‌کردن" if _enabled() else "🟢 روشن‌کردن", b"portal_toggle")],
         [B.inline("🔗 Quick Tunnel", b"portal_mode_quick"), B.inline("🌍 Custom Domain", b"portal_domain")],
         [B.inline("📊 آمار کامل", b"portal_stats"), B.inline("📝 متن خودکار", b"portal_autosend")],
-        [B.inline("📤 ارسال‌های پورتال", b"portal_sends"), B.inline("🔄 ری‌استارت", b"portal_restart")],
-        [B.inline("♻️ بروزرسانی", b"portal_panel"), B.inline("‹ بازگشت", b"home")],
+        [B.inline("📤 ارسال‌های پورتال", b"portal_sends"), B.inline("🔒 قرنطینه", b"portal_quarantine")],
+        [B.inline("🔄 ری‌استارت", b"portal_restart"), B.inline("♻️ بروزرسانی", b"portal_panel")],
+        [B.inline("‹ بازگشت", b"home")],
     ]
 
 
@@ -150,6 +151,30 @@ def _jobs_text() -> tuple[str, list[dict]]:
     return "\n".join(rows), jobs
 
 
+def _quarantine_view(bot) -> tuple[str, list]:
+    accounts = observer.quarantined_accounts()
+    lines = ["🔒 اکانت‌های قرنطینه‌شده", _LINE]
+    buttons = []
+    if not accounts:
+        lines.append("اکانت قرنطینه‌شده‌ای وجود ندارد.")
+    for account in accounts:
+        account_id = int(account["id"])
+        phone = account["phone"]
+        lines.append(f"• {phone} | اطلاعات و Session محفوظ")
+        buttons.append([
+            bot.Button.inline(f"🧪 بررسی {phone}", f"portal_q_recheck_{account_id}".encode()),
+            bot.Button.inline("🔑 ورود مجدد", f"relogin_{account_id}".encode()),
+        ])
+        buttons.append([
+            bot.Button.inline(f"🗑 حذف {phone}", f"portal_q_delete_{account_id}".encode()),
+        ])
+    buttons.extend([
+        [bot.Button.inline("♻️ بروزرسانی", b"portal_quarantine")],
+        [bot.Button.inline("‹ بازگشت", b"portal_panel")],
+    ])
+    return "\n".join(lines), buttons
+
+
 def register(bot) -> None:
     global _registered
     if _registered:
@@ -194,6 +219,63 @@ def register(bot) -> None:
     async def full_stats(event):
         if bot.is_owner(event):
             await bot.safe_edit(event, _stats_text(), buttons=[[B.inline("♻️ بروزرسانی", b"portal_stats")], [B.inline("‹ بازگشت", b"portal_panel")]])
+
+    @client.on(events.CallbackQuery(data=b"portal_quarantine"))
+    async def quarantine_panel(event):
+        if not bot.is_owner(event):
+            return
+        text, buttons = _quarantine_view(bot)
+        await bot.safe_edit(event, text, buttons=buttons)
+
+    @client.on(events.CallbackQuery(pattern=rb"portal_q_recheck_(\d+)"))
+    async def quarantine_recheck(event):
+        if not bot.is_owner(event):
+            return
+        account_id = int(event.pattern_match.group(1))
+        account = db.get_account(account_id)
+        if not account or account.get("status") != "quarantined":
+            await event.answer("اکانت دیگر در قرنطینه نیست.", alert=True)
+            message = "اکانت دیگر در قرنطینه نیست."
+        else:
+            await event.answer("در حال بررسی مجدد Session...")
+            result = await observer.recheck_quarantined(account, bot)
+            message = {
+                "active": "✅ Session سالم تأیید و اکانت دوباره فعال شد.",
+                "invalid": "🔒 Session همچنان نامعتبر است؛ اطلاعات حفظ شد.",
+                "inconclusive": "⚠️ نتیجه موقت/نامشخص بود؛ هیچ تغییری انجام نشد.",
+            }.get(result, "اکانت پیدا نشد.")
+        text, buttons = _quarantine_view(bot)
+        await bot.safe_edit(event, message + "\n\n" + text, buttons=buttons)
+
+    @client.on(events.CallbackQuery(pattern=rb"portal_q_delete_(\d+)"))
+    async def quarantine_delete_prompt(event):
+        if not bot.is_owner(event):
+            return
+        account_id = int(event.pattern_match.group(1))
+        account = db.get_account(account_id)
+        if not account or account.get("status") != "quarantined":
+            await event.answer("اکانت قرنطینه‌شده پیدا نشد.", alert=True)
+            return
+        await bot.safe_edit(
+            event,
+            f"⚠️ حذف قطعی {account['phone']}؟\nDB، تنظیمات و Session این اکانت حذف می‌شود.",
+            buttons=[
+                [B.inline("✅ بله، حذف قطعی", f"portal_q_confirm_{account_id}".encode())],
+                [B.inline("‹ انصراف", b"portal_quarantine")],
+            ],
+        )
+
+    @client.on(events.CallbackQuery(pattern=rb"portal_q_confirm_(\d+)"))
+    async def quarantine_delete_confirm(event):
+        if not bot.is_owner(event):
+            return
+        account_id = int(event.pattern_match.group(1))
+        account = db.get_account(account_id)
+        await event.answer("در حال توقف امن و حذف با تأیید مالک...")
+        deleted = await observer.delete_quarantined(bot, account) if account else False
+        text, buttons = _quarantine_view(bot)
+        result = "✅ اکانت با تأیید مالک حذف شد." if deleted else "⚠️ حذف انجام نشد؛ وضعیت را دوباره بررسی کن."
+        await bot.safe_edit(event, result + "\n\n" + text, buttons=buttons)
 
     @client.on(events.CallbackQuery(data=b"portal_domain"))
     async def domain_panel(event):

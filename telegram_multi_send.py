@@ -1,15 +1,16 @@
-"""Restart-safe multi-account Telegram send orchestrator.
+"""Restart-safe sequential multi-account Telegram send orchestrator.
 
-This module owns its SQLite tables and only uses public helpers from
-``telegram_client`` for client acquisition, contact discovery, and sending.
-It deliberately contains no Telegram client or session construction logic.
+Selected accounts run on the master one at a time.  Every account discovers
+and sends only to its own contacts in the mutual-first order returned by the
+existing ``telegram_client.get_contacts_ordered`` helper.  Content and media
+handling mirror the ordinary Telegram sender; this module owns only its
+isolated durable job tables and never constructs Telegram sessions itself.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import os
-import random
 import sqlite3
 import threading
 import time
@@ -25,6 +26,10 @@ _TASKS: dict[str, asyncio.Task] = {}
 _TASKS_LOCK = threading.RLock()
 _ACCOUNT_LOCKS: dict[str, asyncio.Lock] = {}
 _SCHEMA_LOCK = threading.RLock()
+
+
+class SenderOwnershipError(RuntimeError):
+    """The ordinary sender took ownership while this account was running."""
 
 
 def _account_lock(phone: str) -> asyncio.Lock:
@@ -43,6 +48,17 @@ def _connect() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=15000")
     return conn
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _add_columns(conn: sqlite3.Connection, table: str, definitions: dict[str, str]) -> None:
+    existing = _columns(conn, table)
+    for name, definition in definitions.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
 
 def _init() -> None:
@@ -107,37 +123,67 @@ def _init() -> None:
                 PRIMARY KEY (job_id, recipient_idx, phone)
             )
         """)
+        _add_columns(conn, "tg_multi_jobs", {
+            "account_index": "INTEGER NOT NULL DEFAULT 0",
+            "mutual_total": "INTEGER NOT NULL DEFAULT 0",
+            "skipped_count": "INTEGER NOT NULL DEFAULT 0",
+            "content_items": "INTEGER NOT NULL DEFAULT 0",
+            "start_logged": "INTEGER NOT NULL DEFAULT 0",
+            "finish_logged": "INTEGER NOT NULL DEFAULT 0",
+        })
+        _add_columns(conn, "tg_multi_accounts", {
+            "state": "TEXT NOT NULL DEFAULT 'pending'",
+            "mutual_count": "INTEGER NOT NULL DEFAULT 0",
+            "total": "INTEGER NOT NULL DEFAULT 0",
+            "recipient_index": "INTEGER NOT NULL DEFAULT 0",
+            "stop_reason": "TEXT DEFAULT ''",
+            "finished_at": "REAL",
+        })
+        _add_columns(conn, "tg_multi_recipients", {
+            "phone": "TEXT NOT NULL DEFAULT ''",
+            "account_ordinal": "INTEGER NOT NULL DEFAULT 0",
+            "mutual": "INTEGER NOT NULL DEFAULT 0",
+        })
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tgm_jobs_state ON tg_multi_jobs(state, updated_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tgm_recip_state ON tg_multi_recipients(job_id, state, idx)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tgm_recip_account ON tg_multi_recipients(job_id,phone,state,idx)")
+
+        # The previous implementation stored one shared recipient union without
+        # account ownership.  It cannot be resumed safely under own-contact
+        # semantics, so fail it closed rather than assigning contacts to an
+        # arbitrary account or risking cross-account sends.
+        legacy = conn.execute(
+            "SELECT r.job_id,COUNT(*) AS n FROM tg_multi_recipients r "
+            "JOIN tg_multi_jobs j ON j.job_id=r.job_id "
+            "WHERE r.phone='' AND r.state IN ('pending','inflight') "
+            "AND j.state IN ('queued','running','waiting','stop_requested','paused') "
+            "GROUP BY r.job_id"
+        ).fetchall()
+        for row in legacy:
+            now = time.time()
+            reason = "legacy shared recipient queue disabled; create a new sequential job"
+            conn.execute(
+                "UPDATE tg_multi_recipients SET state='skipped',last_error=?,updated_at=? "
+                "WHERE job_id=? AND phone='' AND state IN ('pending','inflight')",
+                (reason, now, row["job_id"]),)
+            conn.execute(
+                "UPDATE tg_multi_accounts SET state='failed',enabled=0,stop_reason=?,last_error=?,finished_at=? "
+                "WHERE job_id=?", (reason, reason, now, row["job_id"]),)
+            conn.execute(
+                "UPDATE tg_multi_jobs SET state='failed',skipped_count=skipped_count+?,last_error=?,"
+                "current_account=NULL,finished_at=?,updated_at=?,start_logged=1,finish_logged=1 WHERE job_id=?",
+                (int(row["n"] or 0), reason, now, now, row["job_id"]),)
 
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
-def _target_record(value: Any) -> tuple[str, Any]:
-    """Turn common recipient forms into a durable key and sendable reference."""
-    if isinstance(value, dict):
-        explicit_key = value.get("key") or value.get("recipient_key")
-        target = value.get("target", value.get("ref", value.get("entity")))
-        if target is None and value.get("username"):
-            target = "@" + str(value["username"]).lstrip("@")
-        if target is None:
-            target = value.get("user_id", value.get("id"))
-        if target is None:
-            raise ValueError("recipient dict needs target/ref/username/user_id")
-        key = str(explicit_key) if explicit_key is not None else _recipient_key(target)
-        return key, target
-    if not isinstance(value, (str, int)):
-        username = getattr(value, "username", None)
-        target = "@" + str(username).lstrip("@") if username else getattr(value, "id", None)
-        if target is None:
-            raise ValueError(f"unsupported recipient: {type(value).__name__}")
-        return _recipient_key(target), target
-    return _recipient_key(value), value
-
-
 def _recipient_key(target: Any) -> str:
+    if isinstance(target, dict):
+        value = target.get("user_id", target.get("id", target.get("target")))
+        if value is not None:
+            return f"id:{value}"
     if isinstance(target, int):
         return f"id:{target}"
     text = str(target).strip()
@@ -146,17 +192,83 @@ def _recipient_key(target: Any) -> str:
     return "ref:" + text.casefold()
 
 
+def _target_record(value: Any) -> tuple[str, Any]:
+    """Return a durable per-account contact key and a restart-safe target."""
+    if isinstance(value, dict):
+        explicit_key = value.get("key") or value.get("recipient_key")
+        target = value.get("target", value.get("ref", value.get("entity")))
+        if target is None and value.get("username"):
+            target = "@" + str(value["username"]).lstrip("@")
+        if target is None:
+            user_id = value.get("user_id", value.get("id"))
+            access_hash = value.get("access_hash")
+            if user_id is not None and access_hash is not None:
+                target = {"user_id": int(user_id), "access_hash": int(access_hash)}
+            else:
+                target = user_id
+        if target is None:
+            raise ValueError("recipient dict needs target/ref/username/user_id")
+        key = str(explicit_key) if explicit_key is not None else _recipient_key(target)
+        return key, target
+    if not isinstance(value, (str, int)):
+        user_id = getattr(value, "id", None)
+        access_hash = getattr(value, "access_hash", None)
+        username = getattr(value, "username", None)
+        if user_id is not None and access_hash is not None:
+            target = {"user_id": int(user_id), "access_hash": int(access_hash)}
+        elif username:
+            target = "@" + str(username).lstrip("@")
+        else:
+            target = user_id
+        if target is None:
+            raise ValueError(f"unsupported recipient: {type(value).__name__}")
+        return _recipient_key(target), target
+    return _recipient_key(value), value
+
+
+def _send_target(value: Any) -> Any:
+    if isinstance(value, dict) and value.get("user_id") is not None and value.get("access_hash") is not None:
+        from telethon.tl.types import InputPeerUser
+        return InputPeerUser(int(value["user_id"]), int(value["access_hash"]))
+    return value
+
+
+def _target_uid(value: Any) -> int | None:
+    raw = value.get("user_id") if isinstance(value, dict) else value if isinstance(value, int) else None
+    try:
+        return int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _normalize_content(content: dict | None, text: str, file_path: str,
                        caption: str, typing: float, send_timeout: float) -> dict:
     value = dict(content or {})
-    value.setdefault("text", text or "")
-    value.setdefault("file_path", file_path or "")
-    value.setdefault("caption", caption or "")
-    value.setdefault("typing", max(0.0, float(typing or 0)))
-    value.setdefault("send_timeout", max(5.0, float(send_timeout or 120)))
-    if not value["text"] and not value["file_path"]:
-        raise ValueError("text or file_path is required")
-    return value
+    raw_items = value.get("items")
+    items: list[dict] = []
+    if isinstance(raw_items, list):
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "media" and item.get("media"):
+                items.append({
+                    "type": "media",
+                    "media": str(item["media"]),
+                    "caption": item.get("caption", "") or "",
+                })
+            elif item.get("type") == "text" and item.get("text"):
+                items.append({"type": "text", "text": item.get("text", "")})
+    elif file_path:
+        items.append({"type": "media", "media": file_path, "caption": caption or text or ""})
+    elif text:
+        items.append({"type": "text", "text": text})
+    if not items:
+        raise ValueError("ordinary Telegram send content is empty")
+    return {
+        "items": items,
+        "typing": max(0.0, float(value.get("typing", typing) or 0)),
+        "send_timeout": max(5.0, float(value.get("send_timeout", send_timeout) or 120)),
+    }
 
 
 def _account_phones(accounts: Iterable[Any] | None) -> list[str]:
@@ -179,19 +291,69 @@ def _account_phones(accounts: Iterable[Any] | None) -> list[str]:
     return out
 
 
-async def _discover_recipients(phones: list[str]) -> list[Any]:
-    """Build one ordered, deduplicated union through telegram_client APIs."""
-    result: list[Any] = []
-    seen: set[str] = set()
-    for phone in phones:
+def _reserve_sender(phone: str, marker: dict) -> bool:
+    """Use the ordinary sender registry so its existing busy guard also sees us."""
+    try:
+        import bot
+        jobs = getattr(bot, "tg_jobs", None)
+        if jobs is None:
+            return True
+        if phone in jobs:
+            return False
+        jobs[phone] = marker
+        return True
+    except Exception:
+        return True
+
+
+async def _release_and_drop_sender(phone: str, marker: dict) -> bool:
+    """Drop our warm client while the busy marker still blocks new senders."""
+    try:
+        import bot
+        jobs = getattr(bot, "tg_jobs", None)
+    except Exception:
+        jobs = None
+    if jobs is not None and jobs.get(phone) is not marker:
+        return False
+    # telegram_client.drop_client pops the warm client synchronously before its
+    # first disconnect await. Keeping the marker until this returns prevents a
+    # fresh ordinary sender from claiming the account in that handoff window.
+    await tg.drop_client(phone)
+    if jobs is not None and jobs.get(phone) is marker:
+        jobs.pop(phone, None)
+    return True
+
+
+def _owns_sender(phone: str, marker: dict) -> bool:
+    try:
+        import bot
+        jobs = getattr(bot, "tg_jobs", None)
+        return jobs is None or jobs.get(phone) is marker
+    except Exception:
+        return True
+
+
+async def _discover_account(phone: str, ordinal: int) -> tuple[list[tuple[str, Any, int]], int]:
+    marker = {"multi": True, "phase": "discover", "stop": False, "pause": False}
+    if not _reserve_sender(phone, marker):
+        raise RuntimeError(f"Telegram account {phone} already has an ordinary send")
+    try:
         client = await tg.get_client(phone)
-        targets, _mutual_count = await tg.get_contacts_ordered(client)
-        for target in targets:
-            key, durable = _target_record(target)
-            if key not in seen:
-                seen.add(key)
-                result.append(durable)
-    return result
+        targets, mutual_count = await tg.get_contacts_ordered(client)
+        if not _owns_sender(phone, marker):
+            raise SenderOwnershipError("sender ownership changed during contact discovery")
+        result: list[tuple[str, Any, int]] = []
+        seen: set[str] = set()
+        for position, value in enumerate(targets):
+            key, target = _target_record(value)
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append((f"{phone}|{key}", target, 1 if position < int(mutual_count) else 0))
+        actual_mutual = sum(item[2] for item in result)
+        return result, actual_mutual
+    finally:
+        await _release_and_drop_sender(phone, marker)
 
 
 async def create_job(account_phones: Iterable[Any] | None = None,
@@ -200,52 +362,93 @@ async def create_job(account_phones: Iterable[Any] | None = None,
                      text: str = "", file_path: str = "", caption: str = "",
                      typing: float = 0.0, delay: float | None = None,
                      send_timeout: float = 120.0, job_id: str | None = None) -> dict:
-    """Create a durable job without starting it.
+    """Create a durable sequential job from each selected account's contacts.
 
-    ``recipients`` may contain ids, usernames/refs, dicts, or Telethon user-like
-    objects. If omitted, an ordered union of the selected accounts' contacts is
-    built via :func:`telegram_client.get_contacts_ordered`.
+    ``recipients`` remains accepted for compatibility and is applied separately
+    to every selected account.  The owner panel omits it and therefore uses the
+    existing mutual-first contacts of each account.
     """
     _init()
     phones = _account_phones(account_phones if account_phones is not None else accounts)
-    if recipients is None:
-        recipient_values = await _discover_recipients(phones)
-    else:
-        recipient_values = list(recipients)
-    normalized: list[tuple[str, Any]] = []
-    seen: set[str] = set()
-    for value in recipient_values:
-        key, target = _target_record(value)
-        if key in seen:
-            continue
-        seen.add(key)
-        normalized.append((key, target))
-    if not normalized:
-        raise ValueError("no recipients")
-
     payload = _normalize_content(content, text, file_path, caption, typing, send_timeout)
     if delay is None:
         delay = db.tg_get_send_delay()
     delay = max(0.0, float(delay))
+
+    discovered: list[dict] = []
+    supplied = list(recipients) if recipients is not None else None
+    for ordinal, phone in enumerate(phones):
+        values: list[tuple[str, Any, int]] = []
+        mutual_count = 0
+        discovery_error = ""
+        discovery_flood = 0
+        if supplied is None:
+            try:
+                values, mutual_count = await asyncio.wait_for(
+                    _discover_account(phone, ordinal), timeout=float(payload["send_timeout"]))
+            except Exception as exc:
+                discovery_error = f"{type(exc).__name__}: {str(exc)[:180]}"
+                discovery_flood = int(_flood_seconds(exc) or 0)
+                await _log_error(phone, "گرفتن مخاطبین اکانت", exc)
+        else:
+            seen: set[str] = set()
+            for value in supplied:
+                key, target = _target_record(value)
+                if key in seen:
+                    continue
+                seen.add(key)
+                values.append((f"{phone}|{key}", target, 1))
+            mutual_count = len(values)
+        discovered.append({
+            "phone": phone, "ordinal": ordinal, "values": values,
+            "mutual_count": mutual_count, "error": discovery_error,
+            "flood": discovery_flood,
+        })
+    if not any(item["values"] for item in discovered):
+        raise ValueError("no recipients in selected Telegram accounts")
+
     job_id = str(job_id or uuid.uuid4().hex)
     now = time.time()
+    total = sum(len(item["values"]) for item in discovered)
+    mutual_total = sum(int(item["mutual_count"]) for item in discovered)
+    terminal_accounts = sum(1 for item in discovered if item["error"] or not item["values"])
     with _connect() as conn:
         existing = conn.execute("SELECT 1 FROM tg_multi_jobs WHERE job_id=?", (job_id,)).fetchone()
         if existing:
             return status(job_id)
         conn.execute(
-            "INSERT INTO tg_multi_jobs(job_id,state,content_json,delay,total,created_at,updated_at) "
-            "VALUES(?, 'queued', ?, ?, ?, ?, ?)",
-            (job_id, _json(payload), delay, len(normalized), now, now),
+            "INSERT INTO tg_multi_jobs(job_id,state,content_json,delay,total,mutual_total,content_items,"
+            "first_account,account_index,created_at,updated_at) VALUES(?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (job_id, _json(payload), delay, total, mutual_total, len(payload["items"]),
+             phones[0], terminal_accounts, now, now),
         )
+        recipient_rows = []
+        global_idx = 0
+        for item in discovered:
+            phone = item["phone"]
+            ordinal = int(item["ordinal"])
+            values = item["values"]
+            mutual_count = int(item["mutual_count"])
+            error = item["error"]
+            account_state = "failed" if error else "pending" if values else "completed"
+            enabled = 0 if error else 1
+            finished_at = now if account_state != "pending" else None
+            conn.execute(
+                "INSERT INTO tg_multi_accounts(job_id,phone,ordinal,enabled,state,mutual_count,total,"
+                "cooldown_until,failure_count,last_error,stop_reason,finished_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (job_id, phone, ordinal, enabled, account_state, mutual_count, len(values),
+                 now + int(item["flood"]) if item["flood"] else 0, 1 if error else 0,
+                 error, f"discovery failed: {error}" if error else "no contacts" if not values else "",
+                 finished_at),
+            )
+            for key, target, mutual in values:
+                recipient_rows.append((job_id, global_idx, key, _json(target), phone, ordinal, mutual, now))
+                global_idx += 1
         conn.executemany(
-            "INSERT INTO tg_multi_accounts(job_id,phone,ordinal) VALUES(?,?,?)",
-            [(job_id, phone, i) for i, phone in enumerate(phones)],
-        )
-        conn.executemany(
-            "INSERT INTO tg_multi_recipients(job_id,idx,recipient_key,target_json,updated_at) "
-            "VALUES(?,?,?,?,?)",
-            [(job_id, i, key, _json(target), now) for i, (key, target) in enumerate(normalized)],
+            "INSERT INTO tg_multi_recipients(job_id,idx,recipient_key,target_json,phone,account_ordinal,mutual,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            recipient_rows,
         )
     return status(job_id)
 
@@ -258,15 +461,15 @@ def _job(job_id: str) -> dict | None:
 
 
 def status(job_id: str) -> dict:
-    """Return a durable job snapshot, including per-account cooldowns."""
     row = _job(job_id)
     if not row:
         raise KeyError(f"unknown job: {job_id}")
     now = time.time()
     with _connect() as conn:
         accounts = [dict(r) for r in conn.execute(
-            "SELECT phone,ordinal,enabled,cooldown_until,sent_count,failure_count,last_error "
-            "FROM tg_multi_accounts WHERE job_id=? ORDER BY ordinal", (job_id,)).fetchall()]
+            "SELECT phone,ordinal,enabled,state,mutual_count,total,recipient_index,cooldown_until,"
+            "sent_count,failure_count,last_error,stop_reason FROM tg_multi_accounts "
+            "WHERE job_id=? ORDER BY ordinal", (job_id,)).fetchall()]
         counts = {r["state"]: int(r["n"]) for r in conn.execute(
             "SELECT state,COUNT(*) AS n FROM tg_multi_recipients WHERE job_id=? GROUP BY state",
             (job_id,)).fetchall()}
@@ -284,7 +487,6 @@ def status(job_id: str) -> dict:
 
 
 def list_jobs(state: str | None = None, limit: int = 100) -> list[dict]:
-    """List newest jobs; snapshots are intentionally compact."""
     _init()
     limit = max(1, min(int(limit), 500))
     with _connect() as conn:
@@ -298,12 +500,31 @@ def list_jobs(state: str | None = None, limit: int = 100) -> list[dict]:
     return [status(r["job_id"]) for r in rows]
 
 
+def _advance_index(job_id: str, phone: str | None = None) -> int:
+    now = time.time()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT MIN(idx) AS idx FROM tg_multi_recipients WHERE job_id=? AND state='pending'",
+            (job_id,),).fetchone()
+        total_row = conn.execute("SELECT total FROM tg_multi_jobs WHERE job_id=?", (job_id,)).fetchone()
+        index = int(row["idx"]) if row and row["idx"] is not None else int(total_row["total"] if total_row else 0)
+        conn.execute("UPDATE tg_multi_jobs SET recipient_index=?,updated_at=? WHERE job_id=?",
+                     (index, now, job_id))
+        if phone:
+            local = conn.execute(
+                "SELECT COUNT(*) AS n FROM tg_multi_recipients WHERE job_id=? AND phone=? "
+                "AND state IN ('sent','failed','skipped','uncertain')", (job_id, phone)).fetchone()
+            conn.execute(
+                "UPDATE tg_multi_accounts SET recipient_index=? WHERE job_id=? AND phone=?",
+                (int(local["n"] or 0), job_id, phone),)
+    return index
+
+
 def _reconcile_inflight(job_id: str) -> int:
-    """Conservatively skip crash-time in-flight targets to prevent duplicates."""
     now = time.time()
     with _connect() as conn:
         rows = conn.execute(
-            "SELECT idx FROM tg_multi_recipients WHERE job_id=? AND state='inflight'", (job_id,)).fetchall()
+            "SELECT idx,phone FROM tg_multi_recipients WHERE job_id=? AND state='inflight'", (job_id,)).fetchall()
         if not rows:
             return 0
         conn.execute(
@@ -312,28 +533,59 @@ def _reconcile_inflight(job_id: str) -> int:
         conn.execute(
             "UPDATE tg_multi_jobs SET uncertain_count=uncertain_count+?,last_error=?,updated_at=? WHERE job_id=?",
             (len(rows), "in-flight recipients skipped after restart to avoid duplicate delivery", now, job_id),)
-    _advance_index(job_id)
+    for phone in {str(row["phone"]) for row in rows}:
+        _advance_index(job_id, phone)
     return len(rows)
 
 
-def _advance_index(job_id: str) -> int:
-    now = time.time()
+async def _log_card(title: str, rows: list[str]) -> None:
+    try:
+        import bot
+        await bot.log(bot.card(title, rows))
+    except Exception:
+        pass
+
+
+async def _log_error(phone: str, operation: str, exc: BaseException) -> None:
+    try:
+        import bot
+        await bot.log_error("ارسال چنداکانتی تلگرام", phone or "—", operation, exc)
+    except Exception:
+        pass
+
+
+async def _log_start_once(job_id: str) -> None:
     with _connect() as conn:
         row = conn.execute(
-            "SELECT MIN(idx) AS idx FROM tg_multi_recipients WHERE job_id=? AND state='pending'",
-            (job_id,),).fetchone()
-        if row and row["idx"] is not None:
-            index = int(row["idx"])
-        else:
-            total = conn.execute("SELECT total FROM tg_multi_jobs WHERE job_id=?", (job_id,)).fetchone()
-            index = int(total["total"] if total else 0)
-        conn.execute("UPDATE tg_multi_jobs SET recipient_index=?,updated_at=? WHERE job_id=?",
-                     (index, now, job_id))
-    return index
+            "SELECT start_logged,mutual_total,created_at FROM tg_multi_jobs WHERE job_id=?", (job_id,)).fetchone()
+        count = conn.execute("SELECT COUNT(*) AS n FROM tg_multi_accounts WHERE job_id=?", (job_id,)).fetchone()
+        if not row or int(row["start_logged"] or 0):
+            return
+        conn.execute("UPDATE tg_multi_jobs SET start_logged=1 WHERE job_id=?", (job_id,))
+    await _log_card("✈️ جمع‌بندی ارسال چنداکانتی", [
+        f"📱 اکانت‌های انتخاب‌شده: {int(count['n'] or 0)}",
+        f"🤝 مجموع مخاطبان دوطرفه: {int(row['mutual_total'] or 0)}",
+        f"🕒 شروع: {time.strftime('%H:%M')}",
+    ])
+
+
+async def _log_finish_once(job_id: str) -> None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT finish_logged,sent_count FROM tg_multi_jobs WHERE job_id=?", (job_id,)).fetchone()
+        count = conn.execute(
+            "SELECT COUNT(*) AS n FROM tg_multi_accounts WHERE job_id=? AND state!='pending'", (job_id,)).fetchone()
+        if not row or int(row["finish_logged"] or 0):
+            return
+        conn.execute("UPDATE tg_multi_jobs SET finish_logged=1 WHERE job_id=?", (job_id,))
+    await _log_card("✅ پایان ارسال چنداکانتی", [
+        f"📱 اکانت‌های پردازش‌شده: {int(count['n'] or 0)}",
+        f"✅ مجموع ارسال موفق: {int(row['sent_count'] or 0)}",
+        f"🕒 پایان: {time.strftime('%H:%M')}",
+    ])
 
 
 async def start(job_id: str) -> dict:
-    """Start once; repeated concurrent calls return the same in-process task."""
     _init()
     job_id = str(job_id)
     with _TASKS_LOCK:
@@ -366,7 +618,6 @@ async def start(job_id: str) -> dict:
 
 
 async def stop(job_id: str, grace: float = 2.0) -> dict:
-    """Request a checkpointed stop and return promptly even during a slow send."""
     row = _job(job_id)
     if not row:
         raise KeyError(f"unknown job: {job_id}")
@@ -380,9 +631,7 @@ async def stop(job_id: str, grace: float = 2.0) -> dict:
     with _TASKS_LOCK:
         task = _TASKS.get(job_id)
     if not task or task.done():
-        with _connect() as conn:
-            conn.execute("UPDATE tg_multi_jobs SET state='paused',updated_at=? WHERE job_id=?",
-                         (time.time(), job_id))
+        _pause(job_id)
     elif grace > 0:
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout=float(grace))
@@ -392,12 +641,10 @@ async def stop(job_id: str, grace: float = 2.0) -> dict:
 
 
 async def resume(job_id: str) -> dict:
-    """Resume a paused/failed job from its first durable pending recipient."""
     return await start(job_id)
 
 
 async def restore_pending() -> list[dict]:
-    """Restore jobs that were active at process exit; manual pauses stay paused."""
     _init()
     with _connect() as conn:
         rows = conn.execute(
@@ -414,52 +661,41 @@ async def restore_pending() -> list[dict]:
             continue
         _reconcile_inflight(job_id)
         if row["state"] == "stop_requested":
-            with _connect() as conn:
-                conn.execute(
-                    "UPDATE tg_multi_jobs SET state='paused',stop_requested=0,updated_at=? WHERE job_id=?",
-                    (time.time(), job_id),)
+            _pause(job_id)
             continue
         restored.append(await start(job_id))
     return restored
 
 
-def _pick_account(job_id: str, current: str | None, *, rotate: bool = False) -> tuple[dict | None, float | None]:
+def _pause(job_id: str) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE tg_multi_jobs SET state='paused',stop_requested=0,current_account=NULL,updated_at=? "
+            "WHERE job_id=?", (time.time(), job_id),)
+
+
+def _finish(job_id: str, state: str, error: str = "") -> None:
     now = time.time()
     with _connect() as conn:
-        accounts = [dict(r) for r in conn.execute(
-            "SELECT * FROM tg_multi_accounts WHERE job_id=? AND enabled=1 ORDER BY ordinal",
-            (job_id,),).fetchall()]
-        first = conn.execute("SELECT first_account FROM tg_multi_jobs WHERE job_id=?", (job_id,)).fetchone()
-    if not accounts:
-        return None, None
-    eligible = [a for a in accounts if float(a["cooldown_until"] or 0) <= now]
-    if not eligible:
-        return None, min(float(a["cooldown_until"]) for a in accounts)
-    first_account = first["first_account"] if first else None
-    if not first_account:
-        chosen = random.choice(eligible)
-        with _connect() as conn:
-            conn.execute("UPDATE tg_multi_jobs SET first_account=?,current_account=?,updated_at=? WHERE job_id=?",
-                         (chosen["phone"], chosen["phone"], now, job_id))
-        return chosen, None
-    if current:
-        same = next((a for a in eligible if a["phone"] == current), None)
-        if same and not rotate:
-            return same, None
-        ordered = accounts
-        old_pos = next((i for i, a in enumerate(ordered) if a["phone"] == current), -1)
-        for offset in range(1, len(ordered) + 1):
-            candidate = ordered[(old_pos + offset) % len(ordered)]
-            if any(e["phone"] == candidate["phone"] for e in eligible):
-                return candidate, None
-    return eligible[0], None
+        conn.execute(
+            "UPDATE tg_multi_jobs SET state=?,stop_requested=0,current_account=NULL,last_error=?,"
+            "finished_at=?,updated_at=? WHERE job_id=?",
+            (state, error[:240], now, now, job_id),)
 
 
-def _next_recipient(job_id: str) -> dict | None:
+def _next_account(job_id: str) -> dict | None:
     with _connect() as conn:
         row = conn.execute(
-            "SELECT * FROM tg_multi_recipients WHERE job_id=? AND state='pending' ORDER BY idx LIMIT 1",
-            (job_id,),).fetchone()
+            "SELECT * FROM tg_multi_accounts WHERE job_id=? AND state IN ('pending','running') "
+            "ORDER BY ordinal LIMIT 1", (job_id,),).fetchone()
+    return dict(row) if row else None
+
+
+def _next_recipient(job_id: str, phone: str) -> dict | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM tg_multi_recipients WHERE job_id=? AND phone=? AND state='pending' "
+            "ORDER BY idx LIMIT 1", (job_id, phone),).fetchone()
     return dict(row) if row else None
 
 
@@ -468,11 +704,14 @@ def _claim(job_id: str, idx: int, phone: str) -> bool:
     with _connect() as conn:
         cur = conn.execute(
             "UPDATE tg_multi_recipients SET state='inflight',attempts=attempts+1,updated_at=? "
-            "WHERE job_id=? AND idx=? AND state='pending'", (now, job_id, idx),)
+            "WHERE job_id=? AND idx=? AND phone=? AND state='pending'", (now, job_id, idx, phone),)
         if cur.rowcount:
             conn.execute(
                 "UPDATE tg_multi_jobs SET current_account=?,recipient_index=?,state='running',updated_at=? "
                 "WHERE job_id=?", (phone, idx, now, job_id),)
+            conn.execute(
+                "UPDATE tg_multi_accounts SET state='running' WHERE job_id=? AND phone=?",
+                (job_id, phone),)
         return bool(cur.rowcount)
 
 
@@ -483,18 +722,6 @@ def _record_attempt(job_id: str, idx: int, phone: str, outcome: str, detail: str
             "VALUES(?,?,?,?,?,?) ON CONFLICT(job_id,recipient_idx,phone) DO UPDATE SET "
             "outcome=excluded.outcome,detail=excluded.detail,attempted_at=excluded.attempted_at",
             (job_id, idx, phone, outcome, detail[:240], time.time()),)
-
-
-def _recipient_exhausted(job_id: str, idx: int) -> bool:
-    """True when every still-enabled account already failed this recipient."""
-    with _connect() as conn:
-        row = conn.execute(
-            "SELECT COUNT(*) AS n FROM tg_multi_accounts AS a "
-            "WHERE a.job_id=? AND a.enabled=1 AND NOT EXISTS ("
-            "SELECT 1 FROM tg_multi_attempts AS t WHERE t.job_id=a.job_id "
-            "AND t.recipient_idx=? AND t.phone=a.phone AND t.outcome='error')",
-            (job_id, idx),).fetchone()
-    return int(row["n"] or 0) == 0
 
 
 def _flood_seconds(exc: BaseException) -> int | None:
@@ -515,27 +742,56 @@ def _auth_failure(exc: BaseException) -> bool:
     ))
 
 
-async def _send(phone: str, target: Any, content: dict) -> None:
-    """Send once with no internal FloodWait sleep so the fleet can fail over.
+def _account_failure(exc: BaseException) -> bool:
+    if isinstance(exc, SenderOwnershipError):
+        return True
+    if _flood_seconds(exc) is not None or _auth_failure(exc):
+        return True
+    name = type(exc).__name__.lower()
+    return isinstance(exc, (ConnectionError, TimeoutError, OSError)) or any(
+        token in name for token in ("connection", "network", "disconnect")
+    )
 
-    Client acquisition and retry policy stay inside telegram_client APIs. The
-    returned warm client is only used for the actual Telegram call; no client
-    or session is constructed or managed here.
-    """
-    client = await tg.get_client(phone)
-    file_path = content.get("file_path", "")
-    caption = content.get("caption", "") or content.get("text", "")
-    if file_path:
-        call = tg.safe_call(
-            lambda: client.send_file(target, file_path, caption=caption or None),
-            retries=0,
-        )
-    else:
-        call = tg.safe_call(
-            lambda: client.send_message(target, content.get("text", "")),
-            retries=0,
-        )
-    await asyncio.wait_for(call, timeout=float(content.get("send_timeout", 120) or 120))
+
+async def _prepare_content(client: Any, phone: str, content: dict, marker: dict) -> list[dict]:
+    prepared: list[dict] = []
+    for item in content.get("items", []):
+        if not _owns_sender(phone, marker):
+            raise SenderOwnershipError("sender ownership changed during media preparation")
+        if item.get("type") == "media":
+            saved = None
+            try:
+                saved = await tg.upload_to_saved(client, item["media"], item.get("caption", "") or "")
+            except Exception as exc:
+                await _log_error(phone, f"آپلود فایل به Saved — {os.path.basename(item.get('media', ''))}", exc)
+            if not _owns_sender(phone, marker):
+                raise SenderOwnershipError("sender ownership changed during media upload")
+            prepared.append({
+                "type": "media", "saved": saved, "path": item["media"],
+                "caption": item.get("caption", "") or "",
+            })
+        else:
+            prepared.append({"type": "text", "text": item.get("text", "") or ""})
+    return prepared
+
+
+async def _send_content(client: Any, target: Any, prepared: list[dict], phone: str, marker: dict) -> None:
+    for item in prepared:
+        if not _owns_sender(phone, marker):
+            raise SenderOwnershipError("sender ownership changed before delivery")
+        if item["type"] == "media":
+            if item["saved"] is not None:
+                await tg.send_saved_media(client, target, item["saved"], item["caption"])
+            else:
+                await tg.send_media(client, target, item["path"], item["caption"], typing=0)
+            db.tg_incr_sent(phone, 1)
+        elif item["text"]:
+            await tg.send_text(client, target, item["text"], typing=0)
+            db.tg_incr_sent(phone, 1)
+        if not _owns_sender(phone, marker):
+            raise SenderOwnershipError("sender ownership changed during delivery")
+        if len(prepared) > 1:
+            await asyncio.sleep(0.05)
 
 
 async def _interruptible_sleep(job_id: str, seconds: float) -> bool:
@@ -548,26 +804,162 @@ async def _interruptible_sleep(job_id: str, seconds: float) -> bool:
     return True
 
 
-def _pause(job_id: str) -> None:
+def _mark_account_stopped(job_id: str, phone: str, reason: str, exc: BaseException,
+                          current_idx: int | None = None) -> None:
+    now = time.time()
+    flood = _flood_seconds(exc)
     with _connect() as conn:
+        uncertain = 0
+        if current_idx is not None:
+            cur = conn.execute(
+                "UPDATE tg_multi_recipients SET state='uncertain',last_error=?,updated_at=? "
+                "WHERE job_id=? AND idx=? AND state='inflight'",
+                (reason[:240], now, job_id, current_idx),)
+            uncertain = int(cur.rowcount or 0)
+        pending = conn.execute(
+            "SELECT COUNT(*) AS n FROM tg_multi_recipients WHERE job_id=? AND phone=? AND state='pending'",
+            (job_id, phone),).fetchone()
+        skipped = int(pending["n"] or 0)
         conn.execute(
-            "UPDATE tg_multi_jobs SET state='paused',stop_requested=0,current_account=NULL,updated_at=? "
-            "WHERE job_id=?", (time.time(), job_id),)
+            "UPDATE tg_multi_recipients SET state='skipped',last_error=?,updated_at=? "
+            "WHERE job_id=? AND phone=? AND state='pending'", (reason[:240], now, job_id, phone),)
+        state = "floodwait" if flood is not None else "failed"
+        conn.execute(
+            "UPDATE tg_multi_accounts SET state=?,enabled=0,cooldown_until=?,failure_count=failure_count+1,"
+            "last_error=?,stop_reason=?,finished_at=? WHERE job_id=? AND phone=?",
+            (state, now + flood if flood is not None else 0, reason[:240], reason[:240], now, job_id, phone),)
+        conn.execute(
+            "UPDATE tg_multi_jobs SET skipped_count=skipped_count+?,uncertain_count=uncertain_count+?,"
+            "last_error=?,account_index=account_index+1,updated_at=? WHERE job_id=?",
+            (skipped, uncertain, reason[:240], now, job_id),)
+    _advance_index(job_id, phone)
 
 
-def _finish(job_id: str, state: str, error: str = "") -> None:
+def _mark_account_completed(job_id: str, phone: str) -> None:
     now = time.time()
     with _connect() as conn:
         conn.execute(
-            "UPDATE tg_multi_jobs SET state=?,stop_requested=0,current_account=NULL,last_error=?,"
-            "finished_at=?,updated_at=? WHERE job_id=?",
-            (state, error[:240], now, now, job_id),)
+            "UPDATE tg_multi_accounts SET state='completed',stop_reason='contacts completed',finished_at=? "
+            "WHERE job_id=? AND phone=?", (now, job_id, phone),)
+        conn.execute(
+            "UPDATE tg_multi_jobs SET account_index=account_index+1,updated_at=? WHERE job_id=?",
+            (now, job_id),)
+
+
+async def _run_account(job_id: str, account: dict) -> bool:
+    """Run one account to completion. Return False only for a manual pause."""
+    phone = account["phone"]
+    lock = _account_lock(phone)
+    while lock.locked():
+        job = _job(job_id)
+        if not job or job["stop_requested"]:
+            _pause(job_id)
+            return False
+        await asyncio.sleep(0.25)
+    async with lock:
+        marker = {"multi": True, "job_id": job_id, "stop": False, "pause": False}
+        if not _reserve_sender(phone, marker):
+            exc = RuntimeError("ordinary Telegram send is active on this account")
+            await _log_error(phone, "شروع نوبت اکانت", exc)
+            _mark_account_stopped(job_id, phone, str(exc), exc)
+            return True
+        client = None
+        try:
+            client = await tg.get_client(phone)
+            content = json.loads(_job(job_id)["content_json"])
+            prepared = await _prepare_content(client, phone, content, marker)
+            while True:
+                job = _job(job_id)
+                if not job:
+                    return False
+                if job["stop_requested"]:
+                    _pause(job_id)
+                    return False
+                if not _owns_sender(phone, marker):
+                    exc = RuntimeError("sender ownership changed while account was running")
+                    await _log_error(phone, "تداخل با ارسال عادی", exc)
+                    _mark_account_stopped(job_id, phone, str(exc), exc)
+                    return True
+                recipient = _next_recipient(job_id, phone)
+                if not recipient:
+                    _mark_account_completed(job_id, phone)
+                    return True
+                idx = int(recipient["idx"])
+                if not _claim(job_id, idx, phone):
+                    continue
+                durable_target = json.loads(recipient["target_json"])
+                uid = _target_uid(durable_target)
+                if uid is not None and db.tg_was_sent(uid):
+                    now = time.time()
+                    with _connect() as conn:
+                        conn.execute(
+                            "UPDATE tg_multi_recipients SET state='skipped',sent_by=?,last_error='already sent',updated_at=? "
+                            "WHERE job_id=? AND idx=?", (phone, now, job_id, idx),)
+                        conn.execute(
+                            "UPDATE tg_multi_jobs SET skipped_count=skipped_count+1,updated_at=? WHERE job_id=?",
+                            (now, job_id),)
+                    _advance_index(job_id, phone)
+                    continue
+                try:
+                    await asyncio.wait_for(
+                        _send_content(client, _send_target(durable_target), prepared, phone, marker),
+                        timeout=float(content.get("send_timeout") or 120),
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    detail = f"{type(exc).__name__}: {str(exc)[:180]}"
+                    await _log_error(phone, f"ارسال به مخاطب {uid or recipient['recipient_key']}", exc)
+                    _record_attempt(job_id, idx, phone, "error", detail)
+                    if _account_failure(exc):
+                        _mark_account_stopped(job_id, phone, detail, exc, idx)
+                        return True
+                    now = time.time()
+                    with _connect() as conn:
+                        conn.execute(
+                            "UPDATE tg_multi_recipients SET state='failed',last_error=?,updated_at=? "
+                            "WHERE job_id=? AND idx=?", (detail, now, job_id, idx),)
+                        conn.execute(
+                            "UPDATE tg_multi_accounts SET failure_count=failure_count+1,last_error=? "
+                            "WHERE job_id=? AND phone=?", (detail, job_id, phone),)
+                        conn.execute(
+                            "UPDATE tg_multi_jobs SET failed_count=failed_count+1,last_error=?,updated_at=? "
+                            "WHERE job_id=?", (detail, now, job_id),)
+                    _advance_index(job_id, phone)
+                    continue
+
+                now = time.time()
+                _record_attempt(job_id, idx, phone, "sent", "")
+                with _connect() as conn:
+                    conn.execute(
+                        "UPDATE tg_multi_recipients SET state='sent',sent_by=?,last_error='',updated_at=? "
+                        "WHERE job_id=? AND idx=? AND state='inflight'", (phone, now, job_id, idx),)
+                    conn.execute(
+                        "UPDATE tg_multi_accounts SET sent_count=sent_count+1,last_error='' "
+                        "WHERE job_id=? AND phone=?", (job_id, phone),)
+                    conn.execute(
+                        "UPDATE tg_multi_jobs SET sent_count=sent_count+1,last_error='',updated_at=? WHERE job_id=?",
+                        (now, job_id),)
+                if uid is not None:
+                    db.tg_mark_sent(uid)
+                _advance_index(job_id, phone)
+                if not await _interruptible_sleep(job_id, float(job.get("delay") or 0)):
+                    _pause(job_id)
+                    return False
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            detail = f"{type(exc).__name__}: {str(exc)[:180]}"
+            await _log_error(phone, "اتصال/آماده‌سازی اکانت", exc)
+            _mark_account_stopped(job_id, phone, detail, exc)
+            return True
+        finally:
+            await _release_and_drop_sender(phone, marker)
 
 
 async def _run(job_id: str) -> None:
     try:
-        current: str | None = _job(job_id).get("current_account")
-        rotate = False
+        await _log_start_once(job_id)
         while True:
             job = _job(job_id)
             if not job:
@@ -575,113 +967,17 @@ async def _run(job_id: str) -> None:
             if job["stop_requested"]:
                 _pause(job_id)
                 return
-            recipient = _next_recipient(job_id)
-            if not recipient:
+            account = _next_account(job_id)
+            if not account:
                 _finish(job_id, "completed")
+                await _log_finish_once(job_id)
                 return
-
-            account, wake_at = _pick_account(job_id, current, rotate=rotate)
-            rotate = False
-            if account is None:
-                if wake_at is None:
-                    _finish(job_id, "failed", "no enabled account remains")
-                    return
-                with _connect() as conn:
-                    conn.execute("UPDATE tg_multi_jobs SET state='waiting',current_account=NULL,updated_at=? WHERE job_id=?",
-                                 (time.time(), job_id))
-                if not await _interruptible_sleep(job_id, max(0.05, min(1.0, wake_at - time.time()))):
-                    _pause(job_id)
-                    return
-                current = None
-                continue
-
-            phone = account["phone"]
-            current = phone
-            account_lock = _account_lock(phone)
-            if account_lock.locked():
-                rotate = True
-                await asyncio.sleep(0)
-                continue
-            async with account_lock:
-                if not _claim(job_id, int(recipient["idx"]), phone):
-                    continue
-                target = json.loads(recipient["target_json"])
-                content = json.loads(job["content_json"])
-                try:
-                    await _send(phone, target, content)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:  # fail over; never wait on a broken account
-                    detail = f"{type(exc).__name__}: {str(exc)[:180]}"
-                    flood = _flood_seconds(exc)
-                    now = time.time()
-                    if flood is not None:
-                        cooldown = now + flood
-                        _record_attempt(job_id, int(recipient["idx"]), phone, "flood", detail)
-                        with _connect() as conn:
-                            conn.execute(
-                                "UPDATE tg_multi_accounts SET cooldown_until=?,failure_count=failure_count+1,last_error=? "
-                                "WHERE job_id=? AND phone=?", (cooldown, detail, job_id, phone),)
-                            conn.execute(
-                                "UPDATE tg_multi_recipients SET state='pending',last_error=?,updated_at=? "
-                                "WHERE job_id=? AND idx=?", (detail, now, job_id, recipient["idx"]),)
-                        current = phone
-                        rotate = True
-                        continue
-
-                    _record_attempt(job_id, int(recipient["idx"]), phone, "error", detail)
-                    disable = 1 if _auth_failure(exc) else 0
-                    with _connect() as conn:
-                        conn.execute(
-                            "UPDATE tg_multi_accounts SET enabled=CASE WHEN ?=1 THEN 0 ELSE enabled END,"
-                            "failure_count=failure_count+1,last_error=? WHERE job_id=? AND phone=?",
-                            (disable, detail, job_id, phone),)
-                        conn.execute(
-                            "UPDATE tg_multi_recipients SET state='pending',last_error=?,updated_at=? "
-                            "WHERE job_id=? AND idx=?", (detail, now, job_id, recipient["idx"]),)
-                        conn.execute("UPDATE tg_multi_jobs SET last_error=?,updated_at=? WHERE job_id=?",
-                                     (detail, now, job_id),)
-                    if _recipient_exhausted(job_id, int(recipient["idx"])):
-                        with _connect() as conn:
-                            conn.execute(
-                                "UPDATE tg_multi_recipients SET state='failed',updated_at=? WHERE job_id=? AND idx=?",
-                                (now, job_id, recipient["idx"]),)
-                            conn.execute(
-                                "UPDATE tg_multi_jobs SET failed_count=failed_count+1,updated_at=? WHERE job_id=?",
-                                (now, job_id),)
-                        _advance_index(job_id)
-                    current = phone
-                    rotate = True
-                    continue
-
-            now = time.time()
-            _record_attempt(job_id, int(recipient["idx"]), phone, "sent", "")
-            with _connect() as conn:
-                conn.execute(
-                    "UPDATE tg_multi_recipients SET state='sent',sent_by=?,last_error='',updated_at=? "
-                    "WHERE job_id=? AND idx=? AND state='inflight'",
-                    (phone, now, job_id, recipient["idx"]),)
-                conn.execute(
-                    "UPDATE tg_multi_accounts SET sent_count=sent_count+1,last_error='' "
-                    "WHERE job_id=? AND phone=?", (job_id, phone),)
-                conn.execute(
-                    "UPDATE tg_multi_jobs SET sent_count=sent_count+1,last_error='',updated_at=? WHERE job_id=?",
-                    (now, job_id),)
-            try:
-                db.tg_incr_sent(phone, 1)
-            except Exception:
-                pass
-            _advance_index(job_id)
-            if not await _interruptible_sleep(job_id, float(job.get("delay") or 0)):
-                _pause(job_id)
+            if not await _run_account(job_id, account):
                 return
     except asyncio.CancelledError:
-        # Leave the claimed row in-flight. restore_pending() will conservatively
-        # classify it as uncertain instead of risking a duplicate send.
         raise
-    except Exception as exc:  # keep the checkpoint resumable after unexpected bugs
+    except Exception as exc:
         detail = f"orchestrator: {type(exc).__name__}: {str(exc)[:180]}"
-        with _connect() as conn:
-            conn.execute(
-                "UPDATE tg_multi_jobs SET state='failed',last_error=?,finished_at=?,updated_at=? WHERE job_id=?",
-                (detail, time.time(), time.time(), job_id),)
+        _finish(job_id, "failed", detail)
+        await _log_error("", "اجرای Job", exc)
+        await _log_finish_once(job_id)

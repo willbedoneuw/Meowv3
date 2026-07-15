@@ -7,7 +7,7 @@ import db
 import telegram_multi_send as multi
 
 _registered = False
-_selected: dict[int, set[int]] = {}
+_selected: dict[int, list[int]] = {}
 
 
 def register(*, client, events, Button, state, is_owner, safe_edit) -> None:
@@ -17,20 +17,33 @@ def register(*, client, events, Button, state, is_owner, safe_edit) -> None:
     _registered = True
 
     def accounts_for(user_id: int) -> list[dict]:
-        chosen = _selected.setdefault(user_id, set())
-        return [row for row in db.tg_list_accounts() if row.get("status") == "active" and row.get("session")]
+        rows = [row for row in db.tg_list_accounts() if row.get("status") == "active" and row.get("session")]
+        valid = {int(row["rid"]) for row in rows}
+        chosen = _selected.setdefault(user_id, [])
+        chosen[:] = [rid for rid in chosen if rid in valid]
+        return rows
 
     def select_text(user_id: int) -> tuple[str, list]:
         rows = accounts_for(user_id)
-        chosen = _selected.setdefault(user_id, set())
-        text = "✈️ ارسال چنداکانتی تلگرام\n━━━━━━━━━━━━\nاکانت‌ها را انتخاب کن؛ شروع به‌صورت تصادفی و ادامه با failover انجام می‌شود."
+        chosen = _selected.setdefault(user_id, [])
+        text = (
+            "✈️ ارسال چنداکانتی تلگرام\n"
+            "━━━━━━━━━━━━\n"
+            "اکانت‌ها را به ترتیب اجرا انتخاب کن. هر اکانت فقط به مخاطبان خودش و دونه‌به‌دونه ارسال می‌کند."
+        )
         buttons = []
         for row in rows:
             mark = "✅" if int(row["rid"]) in chosen else "▫️"
-            buttons.append([Button.inline(f"{mark} {row['phone']} — {row.get('name') or '—'}", f"tgmsel_{row['rid']}".encode())])
+            buttons.append([Button.inline(
+                f"{mark} {row['phone']} — {row.get('name') or '—'}",
+                f"tgmsel_{row['rid']}".encode(),
+            )])
         if chosen:
-            buttons.append([Button.inline(f"ادامه با {len(chosen)} اکانت ←", b"tgmnext")])
-        buttons.extend([[Button.inline("📊 وضعیت ارسال‌ها", b"tg_multi_jobs")], [Button.inline("‹ بازگشت", b"tg")]])
+            buttons.append([Button.inline(f"شروع با {len(chosen)} اکانت ←", b"tgmnext")])
+        buttons.extend([
+            [Button.inline("📊 وضعیت ارسال‌ها", b"tg_multi_jobs")],
+            [Button.inline("‹ بازگشت", b"tg")],
+        ])
         if not rows:
             text += "\n\nاکانت فعال تلگرام موجود نیست."
         return text, buttons
@@ -44,13 +57,17 @@ def register(*, client, events, Button, state, is_owner, safe_edit) -> None:
         for job in jobs:
             jid, job_state = job["job_id"], job["state"]
             lines.append(
-                f"• {jid[:8]} | {job_state} | ✅ {job['sent_count']}/{job['total']} | ❌ {job['failed_count']}"
+                f"• {jid[:8]} | {job_state} | ✅ {job['sent_count']}/{job['total']} "
+                f"| ❌ {job['failed_count']} | ⚠️ {job['uncertain_count']}"
             )
             if job_state in ("queued", "running", "waiting", "stop_requested"):
                 buttons.append([Button.inline(f"⏹ توقف {jid[:8]}", f"tgmstop_{jid}".encode())])
             elif job_state in ("paused", "failed"):
                 buttons.append([Button.inline(f"▶️ ادامه {jid[:8]}", f"tgmresume_{jid}".encode())])
-        buttons.extend([[Button.inline("♻️ بروزرسانی", b"tg_multi_jobs")], [Button.inline("‹ بازگشت", b"tg_multi")]])
+        buttons.extend([
+            [Button.inline("♻️ بروزرسانی", b"tg_multi_jobs")],
+            [Button.inline("‹ بازگشت", b"tg_multi")],
+        ])
         return "\n".join(lines), buttons
 
     @client.on(events.CallbackQuery(data=b"tg_multi"))
@@ -70,51 +87,51 @@ def register(*, client, events, Button, state, is_owner, safe_edit) -> None:
         if rid not in valid:
             await event.answer("اکانت فعال پیدا نشد.", alert=True)
             return
-        chosen = _selected.setdefault(event.sender_id, set())
-        chosen.remove(rid) if rid in chosen else chosen.add(rid)
+        chosen = _selected.setdefault(event.sender_id, [])
+        if rid in chosen:
+            chosen.remove(rid)
+        else:
+            chosen.append(rid)
         text, buttons = select_text(event.sender_id)
         await safe_edit(event, text, buttons=buttons)
 
     @client.on(events.CallbackQuery(data=b"tgmnext"))
-    async def ask_text(event):
+    async def start_multi(event):
         if not is_owner(event):
             return
         valid = {int(row["rid"]): row for row in accounts_for(event.sender_id)}
-        chosen = [valid[rid]["phone"] for rid in _selected.get(event.sender_id, set()) if rid in valid]
+        chosen = [valid[rid]["phone"] for rid in _selected.get(event.sender_id, []) if rid in valid]
         if not chosen:
             await event.answer("حداقل یک اکانت انتخاب کن.", alert=True)
             return
-        state[event.sender_id] = {"step": "await_tg_multi_text", "phones": chosen}
+        messages = db.tg_msgs_get()
+        if not messages:
+            await event.answer("محتوای ارسال عادی خالی است؛ ابتدا متن یا فایل را در بخش ارسال تنظیم کن.", alert=True)
+            return
+        state.pop(event.sender_id, None)
         await safe_edit(
             event,
-            "📝 متن ارسال را بفرست. مخاطبان اکانت‌های انتخابی یک‌بار deduplicate می‌شوند.",
-            buttons=[[Button.inline("‹ لغو", b"tg_multi")]],
+            "⏳ مخاطبان مستقل هر اکانت با ترتیب دوطرفه‌ها در حال آماده‌سازی است...",
+            buttons=[[Button.inline("📊 وضعیت ارسال‌ها", b"tg_multi_jobs")]],
         )
-
-    @client.on(events.NewMessage)
-    async def text_input(event):
-        if not is_owner(event):
-            return
-        current = state.get(event.sender_id) or {}
-        if current.get("step") != "await_tg_multi_text":
-            return
-        text = (event.raw_text or "").strip()
-        if not text:
-            await event.respond("متن خالی است؛ دوباره بفرست.")
-            return
-        phones = list(current.get("phones") or [])
-        state.pop(event.sender_id, None)
-        await event.respond("⏳ صف مشترک مخاطبان در حال آماده‌سازی است...")
         try:
-            job = await multi.create_job(account_phones=phones, text=text)
+            job = await multi.create_job(account_phones=chosen, content={"items": messages})
             await multi.start(job["job_id"])
         except Exception as exc:
-            await event.respond(f"❌ شروع ارسال ناموفق بود: {type(exc).__name__}: {str(exc)[:160]}")
+            await safe_edit(
+                event,
+                f"❌ شروع ارسال ناموفق بود: {type(exc).__name__}: {str(exc)[:160]}",
+                buttons=[[Button.inline("‹ بازگشت", b"tg_multi")]],
+            )
             return
         _selected.pop(event.sender_id, None)
-        await event.respond(
-            f"✅ ارسال شروع شد.\nJob: `{job['job_id'][:8]}`\nاکانت‌ها: {len(phones)} | مخاطبان یکتا: {job['total']}",
-            buttons=[[Button.inline("📊 وضعیت ارسال‌ها", b"tg_multi_jobs")], [Button.inline("‹ پنل تلگرام", b"tg")]],
+        await safe_edit(
+            event,
+            f"✅ ارسال ترتیبی شروع شد.\nاکانت‌ها: {len(chosen)} | مخاطبان: {job['total']} | دوطرفه: {job['mutual_total']}",
+            buttons=[
+                [Button.inline("📊 وضعیت ارسال‌ها", b"tg_multi_jobs")],
+                [Button.inline("‹ پنل تلگرام", b"tg")],
+            ],
         )
 
     @client.on(events.CallbackQuery(data=b"tg_multi_jobs"))
