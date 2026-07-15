@@ -17,6 +17,7 @@ batch broadcasting, or "send to everyone" automation.
 Panel text is Persian. Only the configured owner id may use it.
 """
 import asyncio
+import contextlib
 import os
 import random
 import tempfile
@@ -109,6 +110,11 @@ linkdooni_engine: dict = {}        # {"task": Task, "stop": bool} for the orches
 # YoudonoaAx — Telegram section state (additive; never touches Rubika dicts).
 tg_pending: dict = {}              # owner_id -> login ctx (code/password phase)
 tg_jobs: dict = {}                 # phone -> live mutual-send control dict
+# Single live Worker update queue. Prevents duplicate Update All clicks and
+# overlap with the per-Worker update callback.
+_worker_update_task = None
+_worker_updating_ids: set = set()
+_worker_update_lock_fd = None
 
 
 def _alert_word(n: int) -> str:
@@ -2410,92 +2416,293 @@ def master_code_version() -> str:
         return "—"
 
 
+def _worker_updates_busy() -> bool:
+    task = _worker_update_task
+    if ((task and not task.done()) or _worker_updating_ids or
+            _worker_update_lock_fd is not None):
+        return True
+
+    # Probe the same OS lock so restart/delete callbacks in a second Master
+    # process also see an update started by the first process.
+    import fcntl
+
+    path = os.path.join(DATA_DIR, "worker-update.lock")
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        return True
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
+def _acquire_worker_update_lock() -> bool:
+    """Cross-process lock; auto-released by the OS if the Master exits."""
+    global _worker_update_lock_fd
+    if _worker_update_lock_fd is not None:
+        return False
+    import fcntl
+
+    path = os.path.join(DATA_DIR, "worker-update.lock")
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return False
+    _worker_update_lock_fd = fd
+    return True
+
+
+def _release_worker_update_lock() -> None:
+    global _worker_update_lock_fd
+    fd = _worker_update_lock_fd
+    _worker_update_lock_fd = None
+    if fd is None:
+        return
+    import fcntl
+
+    with contextlib.suppress(OSError):
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    with contextlib.suppress(OSError):
+        os.close(fd)
+
+
+def _safe_worker_update_command(w) -> str:
+    """Build a bounded remote update which never removes the live container
+    before a candidate image has built and passed an import/version test."""
+    import shlex
+
+    repo = shlex.quote(config.GIT_REPO_URL)
+    branch = shlex.quote(config.GIT_BRANCH)
+    image = shlex.quote(worker.IMAGE)
+    container = shlex.quote(worker.CONTAINER)
+    remote_dir = worker.REMOTE_DIR
+    remote_data = worker.REMOTE_DATA
+    api_port = int(w.get("api_port") or getattr(config, "WORKER_API_PORT", 8765) or 8765)
+    if not 1 <= api_port <= 65535:
+        api_port = 8765
+    return f"""set -eu
+command -v flock >/dev/null 2>&1 || {{ echo ERROR=flock-missing; exit 76; }}
+exec 9>/tmp/v2rubby-worker-update.lock
+flock -n 9 || {{ echo UPDATE_BUSY; exit 75; }}
+cd {remote_dir}
+IMAGE={image}
+CONTAINER={container}
+CANDIDATE="${{IMAGE}}:candidate"
+ROLLBACK="${{IMAGE}}:rollback-update"
+
+echo STAGE=git
+timeout 30 git remote set-url origin {repo}
+timeout 120 git fetch --depth 1 origin {branch}
+timeout 60 git checkout -B {branch} FETCH_HEAD
+TARGET_VERSION="$(timeout 10 git rev-parse --short HEAD)"
+CURRENT_VERSION="$(timeout 20 docker exec "$CONTAINER" python -c 'import worker_api; print(worker_api._worker_code_version())' 2>/dev/null || true)"
+if [ "$CURRENT_VERSION" = "$TARGET_VERSION" ]; then
+    if timeout 30 docker exec "$CONTAINER" python -c 'import urllib.request; response=urllib.request.urlopen("http://127.0.0.1:{api_port}/ping", timeout=10); code=response.status; response.close(); raise SystemExit(0 if code == 200 else 1)'; then
+        echo "ALREADY_CURRENT version=$TARGET_VERSION"
+        exit 0
+    fi
+    echo "CURRENT_UNHEALTHY version=$TARGET_VERSION; rebuilding"
+fi
+
+CURRENT_IMAGE="$(timeout 30 docker inspect -f '{{{{.Image}}}}' "$CONTAINER")"
+timeout 30 docker tag "$CURRENT_IMAGE" "$ROLLBACK"
+REPO_REQ="$(timeout 10 sha256sum requirements.txt | cut -d ' ' -f1)"
+IMAGE_REQ="$(timeout 30 docker run --rm --entrypoint sha256sum "$ROLLBACK" /app/requirements.txt 2>/dev/null | cut -d ' ' -f1 || true)"
+
+if [ -n "$IMAGE_REQ" ] && [ "$REPO_REQ" = "$IMAGE_REQ" ]; then
+    echo STAGE=build-code-only
+    printf '%s\n' \
+      "FROM $ROLLBACK" \
+      'WORKDIR /app' \
+      'RUN find /app -mindepth 1 -maxdepth 1 -exec rm -rf {{}} +' \
+      'COPY . /app' \
+      'RUN mkdir -p /app/data' \
+      'ENV MODE=worker' \
+      'ENV PYTHONUNBUFFERED=1' \
+      'CMD ["python", "main.py"]' > /tmp/Dockerfile.worker-update
+    timeout 300 docker build --network=host -f /tmp/Dockerfile.worker-update -t "$CANDIDATE" .
+    BUILD_MODE=code-only
+else
+    echo STAGE=build-dependencies
+    timeout 1200 docker build --network=host -t "$CANDIDATE" .
+    BUILD_MODE=full
+fi
+
+echo STAGE=test-image
+timeout 60 docker run --rm -e EXPECTED_VERSION="$TARGET_VERSION" --entrypoint python "$CANDIDATE" -c 'import os,worker_api; value=worker_api._worker_code_version(); print(value); raise SystemExit(0 if value == os.environ["EXPECTED_VERSION"] else 1)'
+
+rollback_container() {{
+    timeout 60 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+    timeout 60 docker run -d --name "$CONTAINER" --restart always --network=host \
+      --env-file {remote_dir}/.env -v {remote_data}:/app/data "$ROLLBACK" || return 1
+    sleep 3
+    [ "$(timeout 20 docker inspect -f '{{{{.State.Status}}}}' "$CONTAINER" 2>/dev/null || true)" = "running" ]
+}}
+
+SWAP_ARMED=0
+on_update_exit() {{
+    rc=$?
+    trap - EXIT HUP INT TERM
+    if [ "$SWAP_ARMED" = "1" ]; then
+        echo STAGE=rollback
+        if rollback_container; then
+            echo ROLLBACK_OK
+        else
+            echo ROLLBACK_FAILED
+        fi
+    fi
+    exit "$rc"
+}}
+on_update_signal() {{
+    trap - EXIT HUP INT TERM
+    if [ "$SWAP_ARMED" = "1" ]; then
+        echo STAGE=rollback-signal
+        rollback_container || echo ROLLBACK_FAILED
+    fi
+    exit 73
+}}
+trap on_update_exit EXIT
+trap on_update_signal HUP INT TERM
+
+SWAP_ARMED=1
+echo STAGE=swap
+timeout 60 docker rm -f "$CONTAINER" >/dev/null
+timeout 60 docker run -d --name "$CONTAINER" --restart always --network=host \
+  --env-file {remote_dir}/.env -v {remote_data}:/app/data "$CANDIDATE"
+
+sleep 8
+timeout 30 docker exec "$CONTAINER" python -c 'import urllib.request; response=urllib.request.urlopen("http://127.0.0.1:{api_port}/ping", timeout=10); code=response.status; response.close(); raise SystemExit(0 if code == 200 else 1)'
+
+timeout 30 docker tag "$CANDIDATE" "${{IMAGE}}:latest"
+SWAP_ARMED=0
+trap - EXIT HUP INT TERM
+echo "UPDATE_OK mode=$BUILD_MODE version=$TARGET_VERSION"
+"""
+
+
+async def _safe_update_worker(w):
+    """Return (updated/current/failed, detail) with hard time bounds."""
+    conn = None
+    try:
+        await worker.close_tunnel(w["id"])
+        conn = await asyncio.wait_for(worker._with_conn(w), timeout=20)
+        code, out, err = await asyncio.wait_for(
+            worker._run(conn, _safe_worker_update_command(w)), timeout=2100)
+        text = ((out or "") + "\n" + (err or "")).strip()
+        if code != 0:
+            return "failed", f"exit={code}\n{text[-700:]}"
+        if "ALREADY_CURRENT" in text:
+            detail = next((line for line in text.splitlines()
+                           if line.startswith("ALREADY_CURRENT")),
+                          "ALREADY_CURRENT")
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(worker.check_worker(w), timeout=30)
+            return "current", detail
+        detail = next((line for line in text.splitlines()
+                       if line.startswith("UPDATE_OK")), "UPDATE_OK")
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(worker.check_worker(w), timeout=30)
+        return "updated", detail
+    except asyncio.TimeoutError:
+        return ("failed",
+                "timeout: عملیات Worker از سقف امن زمانی عبور کرد؛ "
+                "rollback ایمن برای مرحله تعویض فعال است.")
+    except Exception as exc:  # noqa: BLE001
+        return "failed", f"{type(exc).__name__}: {str(exc)[:300]}"
+    finally:
+        if conn is not None:
+            with contextlib.suppress(Exception):
+                conn.close()
+
+
 @bot.on(events.CallbackQuery(data=b"w_updall"))
 async def w_updall_cb(event):
+    global _worker_update_task
     if not is_owner(event):
+        return
+    if _worker_updates_busy():
+        await event.answer("یک آپدیت Worker همین حالا در حال اجراست؛ دوباره شروع نشد.", alert=True)
         return
     workers = [w for w in db.list_workers() if not w["is_master"] and w["enabled"]]
     if not workers:
         await event.answer("ورکرِ ریموتِ فعالی برای آپدیت نیست.", alert=True)
         return
+    if not _acquire_worker_update_lock():
+        await event.answer("یک آپدیت Worker در پردازش دیگر در حال اجراست؛ دوباره شروع نشد.",
+                           alert=True)
+        return
     chat_id = event.chat_id
+    try:
+        task = asyncio.create_task(_update_all_workers(chat_id, workers))
+        _worker_update_task = task
+    except Exception:
+        _release_worker_update_lock()
+        raise
+
+    def clear_update_task(done):
+        global _worker_update_task
+        if _worker_update_task is done:
+            _worker_update_task = None
+        _release_worker_update_lock()
+
+    task.add_done_callback(clear_update_task)
     await safe_edit(event,
-        f"⬆️ آپدیتِ {len(workers)} ورکر شروع شد (برنچ: {config.GIT_BRANCH}).\n"
-        "هر ورکر چند دقیقه build می‌شه؛ نتیجه‌ی هرکدوم جداگانه میاد. ⏳",
+        f"⬆️ آپدیت امن {len(workers)} ورکر شروع شد (برنچ: {config.GIT_BRANCH}).\n"
+        "هر Worker فقط یک‌بار و ترتیبی اجرا می‌شود؛ نسخه قبلی تا آماده‌شدن image جدید حفظ می‌شود.",
         buttons=[[Button.inline("🔙 ورکرها", b"workers")]])
-    asyncio.create_task(_update_all_workers(chat_id, workers))
 
 
 async def _update_all_workers(chat_id, workers):
-    """Update every remote worker to config.GIT_BRANCH (checkout + rebuild +
-    rerun) and post a per-worker message as each one finishes — like the owner
-    bot. Uses worker.py's existing SSH primitives; no base file is modified.
-    The data volume is preserved, so the worker's logged-in sessions stay."""
-    ok_n = 0
+    """Sequential, single-instance, timeout-bounded Worker updates."""
+    updated_n = 0
+    current_n = 0
     fail_n = 0
-    # Repoint origin to the CURRENTLY configured repo FIRST, so a worker that was
-    # cloned from a different repo (e.g. the old one) switches over automatically
-    # — no manual SSH needed. Then switch to the configured branch (plain
-    # `git pull` can't switch repo/branch), rebuild the image, recreate container.
-    cmd = (
-        f"cd {worker.REMOTE_DIR} && "
-        f"git remote set-url origin {config.GIT_REPO_URL} && "
-        f"git fetch origin {config.GIT_BRANCH} && "
-        f"git checkout -B {config.GIT_BRANCH} FETCH_HEAD && "
-        f"docker build --network=host -t {worker.IMAGE} . && "
-        f"(docker rm -f {worker.CONTAINER} 2>/dev/null || true) && "
-        f"docker run -d --name {worker.CONTAINER} --restart always "
-        f"--network=host --env-file {worker.REMOTE_DIR}/.env "
-        f"-v {worker.REMOTE_DATA}:/app/data {worker.IMAGE}"
-    )
     for w in workers:
+        wid = int(w["id"])
         tag = w.get("tag", "?")
         ip = w.get("ip", "?")
+        _worker_updating_ids.add(wid)
         try:
-            await bot.send_message(chat_id, f"⏳ در حال آپدیتِ {tag} • {ip} ...")
-        except Exception:
-            pass
-        try:
-            await worker.close_tunnel(w["id"])
-        except Exception:
-            pass
-        try:
-            conn = await worker._with_conn(w)
-            try:
-                code, out, err = await worker._run(conn, cmd)
-            finally:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-            if code == 0:
-                ok_n += 1
-                msg = f"✅ {tag} • {ip} آپدیت شد (برنچ {config.GIT_BRANCH})."
+            with contextlib.suppress(Exception):
+                await bot.send_message(chat_id, f"⏳ آپدیت امن {tag} • {ip} ...")
+            status, detail = await _safe_update_worker(w)
+            if status == "updated":
+                updated_n += 1
+                msg = f"✅ {tag} • {ip} آپدیت شد.\n{detail}"
+            elif status == "current":
+                current_n += 1
+                msg = f"⏭ {tag} • {ip} از قبل به‌روز بود؛ رد شد.\n{detail}"
             else:
                 fail_n += 1
-                msg = f"❌ {tag} • {ip} ناموفق:\n{((err or out) or '')[-400:]}"
-        except Exception as e:  # noqa: BLE001
-            fail_n += 1
-            msg = f"❌ {tag} • {ip} خطا: {repr(e)[:200]}"
-        try:
+                msg = f"❌ {tag} • {ip} ناموفق؛ rollback ایمن فعال بود.\n{detail[-700:]}"
+        finally:
+            _worker_updating_ids.discard(wid)
+        with contextlib.suppress(Exception):
             await bot.send_message(chat_id, msg)
-        except Exception:
-            pass
-        # avoid a duplicate when the button was pressed FROM the log group
-        # itself (then chat_id == LOG_GROUP_ID and log() would repost it).
         if chat_id != config.LOG_GROUP_ID:
-            try:
+            with contextlib.suppress(Exception):
                 await log(msg)
-            except Exception:
-                pass
-    final = card("⬆️ آپدیتِ همه‌ی ورکرها — پایان", [
-        f"✅ موفق : {ok_n}    ❌ ناموفق : {fail_n}",
+    final = card("⬆️ آپدیت امن همه Workerها — پایان", [
+        f"✅ آپدیت‌شده : {updated_n}",
+        f"⏭ از قبل به‌روز : {current_n}",
+        f"❌ ناموفق : {fail_n}",
         f"🕒 {now()}",
     ])
-    try:
+    with contextlib.suppress(Exception):
         await bot.send_message(chat_id, final)
-    except Exception:
-        pass
 
 
 @bot.on(events.CallbackQuery(data=b"w_versions"))
@@ -2672,10 +2879,16 @@ async def wk_toggle_cb(event):
 async def wk_restart_cb(event):
     if not is_owner(event):
         return
+    if _worker_updates_busy():
+        await event.answer("هنگام آپدیت Worker امکان ری‌استارت نیست.", alert=True)
+        return
     wid = int(event.pattern_match.group(1))
     w = db.get_worker(wid)
     if not w or w["is_master"]:
         await event.answer("روی مستر قابل اجرا نیست.", alert=True)
+        return
+    if not _acquire_worker_update_lock():
+        await event.answer("یک عملیات Worker در پردازش دیگر در حال اجراست.", alert=True)
         return
     await event.answer("در حال ری‌استارت ...")
     try:
@@ -2685,6 +2898,8 @@ async def wk_restart_cb(event):
         await safe_edit(event, f"❌ خطا در ری‌استارت: {repr(e)[:150]}",
                          buttons=[[Button.inline("🔙 بازگشت", f"wk_{wid}".encode())]])
         return
+    finally:
+        _release_worker_update_lock()
     await wk_detail_cb(event)
 
 
@@ -2697,15 +2912,35 @@ async def wk_update_cb(event):
     if not w or w["is_master"]:
         await event.answer("روی مستر قابل اجرا نیست.", alert=True)
         return
-    await safe_edit(event, f"⬆️ در حال آپدیت ورکر {w['tag']} (git pull + rebuild) ...")
+    if _worker_updates_busy():
+        await event.answer("یک آپدیت Worker همین حالا در حال اجراست؛ دوباره شروع نشد.", alert=True)
+        return
+    if not _acquire_worker_update_lock():
+        await event.answer("یک آپدیت Worker در پردازش دیگر در حال اجراست؛ دوباره شروع نشد.",
+                           alert=True)
+        return
+    _worker_updating_ids.add(wid)
+    status = "failed"
+    detail = "آپدیت شروع نشد."
     try:
-        await worker.close_tunnel(wid)
-        await worker.update_worker(w)
-    except Exception as e:  # noqa: BLE001
-        await safe_edit(event, f"❌ خطا در آپدیت: {repr(e)[:150]}",
+        with contextlib.suppress(Exception):
+            await safe_edit(event, f"⬆️ آپدیت امن Worker {w['tag']} شروع شد؛ نسخه قبلی تا تست image جدید حفظ می‌شود...")
+        status, detail = await _safe_update_worker(w)
+    finally:
+        _worker_updating_ids.discard(wid)
+        _release_worker_update_lock()
+    if status == "failed":
+        await safe_edit(event, f"❌ آپدیت ناموفق؛ rollback ایمن فعال بود.\n{detail[-700:]}",
                          buttons=[[Button.inline("🔙 بازگشت", f"wk_{wid}".encode())]])
         return
-    await wk_detail_cb(event)
+    if status == "current":
+        await safe_edit(event, f"⏭ Worker {w['tag']} از قبل به‌روز بود؛ تغییری انجام نشد.\n{detail}",
+                         buttons=[[Button.inline("🧾 نسخه‌ها", b"w_versions")],
+                                  [Button.inline("🔙 بازگشت", f"wk_{wid}".encode())]])
+        return
+    await safe_edit(event, f"✅ Worker {w['tag']} با موفقیت آپدیت شد.\n{detail}",
+                    buttons=[[Button.inline("🧾 نسخه‌ها", b"w_versions")],
+                             [Button.inline("🔙 بازگشت", f"wk_{wid}".encode())]])
 
 
 @bot.on(events.CallbackQuery(pattern=b"wkchk_(\\d+)"))
@@ -2740,17 +2975,26 @@ async def wk_del_confirm_cb(event):
 async def wk_del_do_cb(event):
     if not is_owner(event):
         return
+    if _worker_updates_busy():
+        await event.answer("هنگام آپدیت Worker امکان حذف نیست.", alert=True)
+        return
     wid = int(event.pattern_match.group(1))
     w = db.get_worker(wid)
     if not w:
         return
-    await safe_edit(event, "🗑 در حال پاک‌سازی سرور و حذف ورکر ...")
-    if not w["is_master"]:
-        try:
-            await worker.teardown_worker(w)
-        except Exception:
-            pass
-    db.delete_worker(wid)
+    if not _acquire_worker_update_lock():
+        await event.answer("یک عملیات Worker در پردازش دیگر در حال اجراست.", alert=True)
+        return
+    try:
+        await safe_edit(event, "🗑 در حال پاک‌سازی سرور و حذف ورکر ...")
+        if not w["is_master"]:
+            try:
+                await worker.teardown_worker(w)
+            except Exception:
+                pass
+        db.delete_worker(wid)
+    finally:
+        _release_worker_update_lock()
     await safe_edit(event, f"✅ ورکر {w['tag']} حذف شد.",
                      buttons=[[Button.inline("🔙 بازگشت", b"workers")]])
 
